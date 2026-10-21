@@ -1,0 +1,5 @@
+# Korea3MinBreakoutTrader - 실행에 필요한 패키지
+PySide6>=6.6.0
+requests>=2.31.0
+websocket-client>=1.7.0   # 키움 조건검색 (웹소켓)
+tzdata>=2024.1        # Windows에서 Asia/Seoul 시간대 사용

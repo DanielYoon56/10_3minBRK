@@ -1,0 +1,4 @@
+# 개발/테스트/EXE 빌드용
+-r requirements.txt
+pytest>=8.0.0
+pyinstaller>=6.3.0

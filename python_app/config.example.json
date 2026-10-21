@@ -1,0 +1,78 @@
+{
+  "config_version": 2,
+  "trading_mode": "MOCK",
+  "kiwoom": {
+    "mock": {
+      "app_key": "",
+      "secret_key": ""
+    },
+    "real": {
+      "app_key": "",
+      "secret_key": ""
+    }
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "autostart": {
+    "auto_start_trading": true,
+    "allow_real_autostart": false,
+    "quit_after_close": true,
+    "quit_time": "15:40"
+  },
+  "trade_start_time": "09:03",
+  "trade_end_time": "10:00",
+  "breakout_reference": "open",
+  "min_volume_ratio": 0.7,
+  "stop_loss_rate": 2.0,
+  "trailing_retrace_rate": 15.0,
+  "trailing_activation_rate": 1.0,
+  "take_profit_rate": 0.0,
+  "use_first_bar_low_stop": false,
+  "eod_liquidation": true,
+  "eod_liquidation_time": "15:15",
+  "carryover_sell_at_open": true,
+  "order_amount_per_trade": 1000000,
+  "max_concurrent_positions": 3,
+  "max_daily_loss": 300000,
+  "allow_reentry_same_day": false,
+  "screener": {
+    "enabled": true,
+    "vol_surge_ratio": 2.0,
+    "avg_days": 20,
+    "upper_wick_max": 0.25,
+    "min_price": 1000,
+    "min_market_cap": 300000000000,
+    "min_trade_value": 3000000000,
+    "net_buy_top": 20,
+    "min_net_buy_amount": 1000000000,
+    "max_watch": 30,
+    "exclude_etf_spac_pref": true,
+    "condition_name": "",
+    "max_candidates": 400
+  },
+  "watchlist": [
+    {
+      "symbol": "005930",
+      "name": "삼성전자"
+    },
+    {
+      "symbol": "000660",
+      "name": "SK하이닉스"
+    },
+    {
+      "symbol": "005380",
+      "name": "현대차"
+    },
+    {
+      "symbol": "247540",
+      "name": "에코프로비엠"
+    },
+    {
+      "symbol": "035420",
+      "name": "NAVER"
+    }
+  ]
+}

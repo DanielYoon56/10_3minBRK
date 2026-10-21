@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# 로컬 전용 (앱키·텔레그램 토큰·계좌 상태·DB·로그) — 절대 공유 금지
+python_app/config.json
+python_app/live_state_*.json
+python_app/logs/
+*.db
+*.log
+app.lock
+python_app/screen_*.json
