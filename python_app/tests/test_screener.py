@@ -1,6 +1,6 @@
 """
 전일 종가 기준 매집 종목 스캐너 테스트 (가짜 키움 서버, 실제 조회 없음)
-매집 = ①(거래량 급증·양봉·고가 근처 마감) OR ②(외국인·기관 순매수 상위), 공통: 주가 ≥ 1,000원, 시총 ≥ 3,000억
+매집 = ①(거래량 급증·양봉·고가 근처 마감) OR ②(외국인 AND 기관 순매수 상위), 공통: 주가 ≥ 1,000원, 시총 ≥ 3,000억
 """
 
 from datetime import datetime, timedelta
@@ -42,7 +42,7 @@ def add_stock(fake, sym, name, avg_vol, prev_bar, mac, top=True):
 def build_market(fake):
     # A: ① 거래량 3배·양봉·고가 근처 마감·대금 31.6억·시총 5,000억(억 단위 값) → 선정
     add_stock(fake, "111111", "에이전자", 100_000, (10000, 10600, 9900, 10550, 300_000), "5000")
-    # B: ① 불통(음봉) 이지만 ② 기관 순매수 50억 · 시총 8,000억(원 단위 값) → 선정
+    # B: ① 불통(음봉) 이지만 ② 외국인 20억 + 기관 50억 순매수 · 시총 8,000억(원 단위 값) → 선정
     add_stock(fake, "222222", "비화학", 100_000, (10600, 10700, 9900, 10000, 300_000), "800000000000")
     # C: ① 해당하지만 시총 1,000억 → 제외
     add_stock(fake, "333333", "씨소형", 100_000, (10000, 10600, 9900, 10550, 300_000), "1000")
@@ -61,6 +61,7 @@ def build_market(fake):
     fake.frgn_inst_rows = [
         {"for_netprps_stk_cd": "666666", "for_netprps_stk_nm": "에프소액", "for_netprps_amt": "+50",   # 5억 → 미달
          "orgn_netprps_stk_cd": "222222", "orgn_netprps_stk_nm": "비화학", "orgn_netprps_amt": "+500"},  # 50억
+        {"for_netprps_stk_cd": "222222", "for_netprps_stk_nm": "비화학", "for_netprps_amt": "+200"},   # 20억
     ]
 
 
@@ -77,7 +78,7 @@ def test_or_rule_and_common_filters(tmp_path):
     assert [h.symbol for h in res.hits] == ["111111", "222222"]
     a, b = res.hits
     assert a.reasons == ["①"] and a.vol_ratio == 3.0
-    assert b.reasons == ["②기관"] and b.net_buy_amount == 5_000_000_000
+    assert b.reasons == ["②외국인", "②기관"] and b.net_buy_amount == 7_000_000_000
     assert "시총 5,000억" in a.detail and "시총 8,000억" in b.detail
 
 
@@ -97,9 +98,28 @@ def test_both_conditions_rank_first(tmp_path):
     fake = FakeKiwoom()
     build_market(fake)
     fake.frgn_inst_rows.append({"for_netprps_stk_cd": "111111", "for_netprps_stk_nm": "에이전자",
-                                "for_netprps_amt": "+300"})
+                                "for_netprps_amt": "+300",
+                                "orgn_netprps_stk_cd": "111111", "orgn_netprps_stk_nm": "에이전자",
+                                "orgn_netprps_amt": "+150"})
     res = screener(fake, tmp_path).run(TODAY, use_cache=False)
-    assert res.hits[0].symbol == "111111" and res.hits[0].reasons == ["①", "②외국인"]
+    assert res.hits[0].symbol == "111111" and res.hits[0].reasons == ["①", "②외국인", "②기관"]
+
+
+def test_net_buy_requires_both_foreign_and_inst(tmp_path):
+    """외국인만 또는 기관만 순매수 상위인 종목은 ② 불통"""
+    fake = FakeKiwoom()
+    build_market(fake)
+    fake.frgn_inst_rows = [
+        {"for_netprps_stk_cd": "666666", "for_netprps_stk_nm": "에프소액", "for_netprps_amt": "+300",  # 외국인만
+         "orgn_netprps_stk_cd": "222222", "orgn_netprps_stk_nm": "비화학", "orgn_netprps_amt": "+500"},  # 기관만
+    ]
+    syms = {h.symbol for h in screener(fake, tmp_path).run(TODAY, use_cache=False).hits}
+    assert "666666" not in syms and "222222" not in syms
+    # 한쪽 금액이 하한 미달이어도 불통
+    fake.frgn_inst_rows.append({"for_netprps_stk_cd": "222222", "for_netprps_stk_nm": "비화학",
+                                "for_netprps_amt": "+50"})   # 5억 < 10억
+    syms = {h.symbol for h in screener(fake, tmp_path).run(TODAY, use_cache=False).hits}
+    assert "222222" not in syms
 
 
 def test_threshold_settings_respected(tmp_path):

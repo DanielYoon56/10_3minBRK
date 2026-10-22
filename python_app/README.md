@@ -134,7 +134,7 @@ Korea3minTrader/
     ├── strategy/exit_rules.py  # 손절 -2% / 트레일링 15%
     ├── broker/kiwoom_rest.py   # 키움증권 REST API (모의 mockapi / 실거래 api.kiwoom.com)
     ├── broker/kiwoom_condition.py  # 키움 조건검색 (웹소켓: LOGIN · CNSRLST · CNSRREQ)
-    ├── screener/accumulation.py    # 감시종목 선정: 조건식 AND (① 거래량·캔들 OR ② 외국인·기관 순매수)
+    ├── screener/accumulation.py    # 감시종목 선정: 조건식 AND (① 거래량·캔들 OR ② 외국인 AND 기관 순매수)
     ├── broker/paper.py         # 오프라인 모의 브로커 (테스트용)
     ├── models/types.py         # 데이터 모델 · 전략 설정값
     ├── db/storage.py           # SQLite 기록

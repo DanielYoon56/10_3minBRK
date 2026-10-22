@@ -427,7 +427,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._build_screener_box())
 
         info = QLabel(
-            "★ 감시종목: 키움 조건식 결과 중 전일 매집(① 거래량 급증·양봉·고가 근처 마감  또는  ② 외국인·기관 순매수 상위) 종목\n"
+            "★ 감시종목: 키움 조건식 결과 중 전일 매집(① 거래량 급증·양봉·고가 근처 마감  또는  ② 외국인·기관 동시 순매수 상위) 종목\n"
             "★ 매수: 3분봉 종가가 첫 3분봉 시가(당일 시가)를 상향 돌파 + 돌파 봉 거래량 > 첫 봉 거래량 × 배수\n"
             "★ 매도: ① 매입가 대비 손절  ② +1% 이상 오른 뒤 최고가까지 상승분의 N%를 되돌리면 전량 시장가 청산  ③ 장 마감 전 일괄 청산\n"
             "★ 주의: 감시·매도는 이 앱이 켜져 있을 때만 작동합니다 (PC 절전·종료 시 중단)\n"
@@ -439,7 +439,7 @@ class MainWindow(QMainWindow):
 
     def _build_screener_box(self) -> QWidget:
         sc = self.cfg["screener"]
-        box = QGroupBox("감시종목 자동 선정 — 키움 조건식 AND 전일 매집 (① 거래량·캔들  또는  ② 외국인·기관 순매수)")
+        box = QGroupBox("감시종목 자동 선정 — 키움 조건식 AND 전일 매집 (① 거래량·캔들  또는  ② 외국인·기관 동시 순매수)")
         g = QGridLayout(box)
 
         self.chk_scr = QCheckBox("매일 장 전(08:00~) 자동 선정 사용  (끄면 설정 파일의 고정 종목 감시)")
@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
         self.scr_mcap = ispin(0, 1_000_000, 500, sc["min_market_cap"] / 1e8, " 억")
         rows = [
             ("① 전일 거래량 ≥ 20일 평균 ×", self.scr_vol, "① 윗꼬리 ≤ (당일 범위 대비)", self.scr_wick),
-            ("① 전일 거래대금 ≥", self.scr_value, "② 외국인·기관 순매수 상위", self.scr_top),
+            ("① 전일 거래대금 ≥", self.scr_value, "② 외국인·기관 각각 순매수 상위", self.scr_top),
             ("② 순매수 금액 ≥", self.scr_netbuy, "최대 감시 종목 수", self.scr_max),
             ("주가 ≥ (조건식 미사용 시만)", self.scr_price, "시가총액 ≥ (조건식 미사용 시만)", self.scr_mcap),
         ]

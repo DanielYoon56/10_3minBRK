@@ -17,8 +17,8 @@ Korea3MinBreakoutTrader - 전일 종가 기준 매집 종목 스캐너
    ※ 후보군 = 전일 거래량 상위 100 + 거래대금 상위 100 (전 시장)
 
 ② 수급 매집 (ka90009)
-   - 전일 외국인 순매수 상위 net_buy_top 종목 또는 기관 순매수 상위 net_buy_top 종목
-   - 순매수 금액 ≥ min_net_buy_amount
+   - 전일 외국인 순매수 상위 net_buy_top 종목 이면서(AND) 기관 순매수 상위 net_buy_top 종목
+   - 외국인·기관 순매수 금액 각각 ≥ min_net_buy_amount
 
 공통 필터 (①·② 모두 적용, ka10001)
    - 주가 ≥ 1,000원 (min_price)
@@ -65,8 +65,8 @@ class ScreenerConfig:
     min_price: int = 1_000               # 공통: 주가 하한 (원)
     min_market_cap: int = 300_000_000_000  # 공통: 시가총액 하한 (원, 3,000억)
     min_trade_value: int = 3_000_000_000  # ① 전일 거래대금 하한 (원, 30억)
-    net_buy_top: int = 20                # ② 외국인/기관 순매수 상위 N
-    min_net_buy_amount: int = 1_000_000_000  # ② 순매수 금액 하한 (원, 10억)
+    net_buy_top: int = 20                # ② 외국인 AND 기관 순매수 상위 N
+    min_net_buy_amount: int = 1_000_000_000  # ② 외국인·기관 각각의 순매수 금액 하한 (원, 10억)
     max_watch: int = 30                  # 최종 감시 종목 수 상한
     exclude_etf_spac_pref: bool = True
     condition_name: str = ""             # 키움 조건식 이름 ("" = 사용 안 함)
@@ -268,7 +268,9 @@ class AccumulationScreener:
             fi = {"foreign": [], "inst": []}
             errors.append(f"외국인·기관 매매 상위 조회 실패: {e}")
         cand_set = {c["symbol"] for c in uniq}
-        for key, label in (("foreign", "외국인"), ("inst", "기관")):
+        qualified: Dict[str, Dict[str, dict]] = {}
+        for key in ("foreign", "inst"):
+            qualified[key] = {}
             for row in fi.get(key, [])[: cfg.net_buy_top]:
                 if row["amount"] < cfg.min_net_buy_amount:
                     continue
@@ -276,15 +278,18 @@ class AccumulationScreener:
                     continue          # 조건식 AND: 조건식 결과에 없는 종목은 제외
                 if cfg.exclude_etf_spac_pref and is_excluded_name(row["name"]):
                     continue
-                h = hits.get(row["symbol"])
-                if not h:
-                    h = ScreenHit(symbol=row["symbol"], name=row["name"])
-                    hits[row["symbol"]] = h
-                tag = f"②{label}"
-                if tag not in h.reasons:
-                    h.reasons.append(tag)
-                h.net_buy_amount += row["amount"]
-                h.detail = (h.detail + " · " if h.detail else "") + f"{label} 순매수 {row['amount'] / 1e8:,.0f}억"
+                qualified[key][row["symbol"]] = row
+        # 외국인 AND 기관: 두 순위에 모두 든 종목만
+        for sym in [s_ for s_ in qualified["foreign"] if s_ in qualified["inst"]]:
+            h = hits.get(sym)
+            if not h:
+                h = ScreenHit(symbol=sym, name=qualified["foreign"][sym]["name"])
+                hits[sym] = h
+            for key, label in (("foreign", "외국인"), ("inst", "기관")):
+                amt = qualified[key][sym]["amount"]
+                h.reasons.append(f"②{label}")
+                h.net_buy_amount += amt
+                h.detail = (h.detail + " · " if h.detail else "") + f"{label} 순매수 {amt / 1e8:,.0f}억"
 
         # --- 공통 필터: 주가 ≥ min_price, 시가총액 ≥ min_market_cap (조건식 사용 시 생략 — 조건식에서 처리)
         dropped = 0
