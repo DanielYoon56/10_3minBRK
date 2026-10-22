@@ -2,9 +2,12 @@
 
 from datetime import datetime
 
+import requests
+
 from python_app.engine.live_engine import EngineSettings, LiveTradingEngine
 from python_app.models.types import StrategyConfig, TradingMode
-from python_app.notify.telegram import TelegramNotifier
+from python_app.notify import telegram
+from python_app.notify.telegram import TelegramNotifier, mask_token
 from python_app.tests.fake_kiwoom import Clock, FakeKiwoom
 from python_app.tests.test_kiwoom_live import make_broker, seed_breakout_day
 
@@ -57,6 +60,21 @@ def test_bad_token_returns_error_without_endless_retry():
     sess = FakeTgSession(status=401, body={"ok": False, "description": "Unauthorized"})
     ok, msg = TelegramNotifier("BAD", "1", session=sess).send_now("x")
     assert not ok and "Unauthorized" in msg and len(sess.sent) == 1
+
+
+def test_network_error_masks_token(monkeypatch, caplog):
+    token = "123456789:AAFakeTokenForTestsOnly_abcdefg"
+
+    class DownSession:
+        def post(self, url, json=None, timeout=None):
+            raise requests.ConnectionError(f"Max retries exceeded with url: /bot{token}/sendMessage")
+
+    monkeypatch.setattr(telegram.time, "sleep", lambda s: None)
+    ok, msg = TelegramNotifier(token, "1", session=DownSession()).send_now("x")
+    assert not ok
+    assert token not in msg and "123456789:***" in msg
+    assert token not in caplog.text and "123456789:***" in caplog.text
+    assert mask_token("no token here") == "no token here"
 
 
 def test_find_chat_ids():

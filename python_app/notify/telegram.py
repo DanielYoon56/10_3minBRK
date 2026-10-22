@@ -14,6 +14,7 @@ Korea3MinBreakoutTrader - 텔레그램 알림
 
 import logging
 import queue
+import re
 import threading
 import time
 from typing import List, Optional, Tuple
@@ -23,6 +24,12 @@ import requests
 logger = logging.getLogger("Korea3MinBreakoutTrader.Telegram")
 
 API = "https://api.telegram.org/bot{token}/{method}"
+_TOKEN_RE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{20,}")
+
+
+def mask_token(text) -> str:
+    """예외 메시지 등에 섞인 봇 토큰(요청 URL 포함)을 가림"""
+    return _TOKEN_RE.sub(lambda m: m.group(0).split(":")[0] + ":***", str(text))
 
 
 class TelegramNotifier:
@@ -96,8 +103,8 @@ class TelegramNotifier:
                 if r.status_code in (400, 401, 403, 404):
                     return False, desc        # 토큰/chat_id 오류 → 재시도 무의미
             except requests.RequestException as e:
-                logger.error("텔레그램 통신 오류: %s", e)
-                desc = str(e)
+                desc = mask_token(e)
+                logger.error("텔레그램 통신 오류: %s", desc)
             time.sleep(1.5 * (attempt + 1))
         return False, desc
 
@@ -109,7 +116,7 @@ class TelegramNotifier:
             r = self.session.get(API.format(token=self.bot_token, method="getUpdates"), timeout=10)
             data = r.json()
         except (requests.RequestException, ValueError) as e:
-            logger.error("getUpdates 실패: %s", e)
+            logger.error("getUpdates 실패: %s", mask_token(e))
             return []
         found = {}
         for upd in data.get("result", []):
