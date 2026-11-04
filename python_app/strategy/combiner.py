@@ -2,18 +2,18 @@
 Korea3MinBreakoutTrader - 매수 전략 조합 (AND / OR)
 
 선택 가능한 전략 (StrategyConfig.entry_strategies, 아래 순서가 우선순위)
-  open_breakout  첫 3분봉 시가 돌파 (기존 기본 전략, strategy/breakout.py)
-  orb_high       A. 첫 3분봉 고가 돌파 (strategy/intraday.py)
-  vwap_pullback  B. VWAP 눌림 반등
-  prev_high      C. 전일 고가 돌파
-  day_swing_high D. 당일 전고점 돌파 (자체 손절·트레일링)
-  smc_fvg        SMC CHoCH → 첫 FVG 중간값 지정가 (strategy/smc.py)
+  open_breakout  A. 첫 3분봉 시가 돌파 (기존 기본 전략, strategy/breakout.py)
+  orb_high       B. 첫 3분봉 고가 돌파 (strategy/intraday.py)
+  vwap_pullback  C. VWAP 눌림 반등
+  prev_high      D. 전일 고가 돌파
+  day_swing_high E. 당일 전고점 돌파 (자체 손절·트레일링)
+  smc_fvg        F. SMC CHoCH → 첫 FVG 중간값 지정가 (strategy/smc.py)
 
 조합 (StrategyConfig.entry_logic)
   OR  : 선택한 전략 중 하나라도 신호 → 그 신호로 진입 (같은 봉에 여럿이면 위 우선순위)
   AND : 선택한 전략이 '당일' 모두 한 번 이상 신호를 낸 시점(마지막 신호가 나온 봉)에 진입.
         진입 방식·손절·목표는 마지막(이번 봉) 신호의 것을 쓴다.
-        예) A + SMC: A 가 09:20 에 나고 SMC 셋업이 10:40 에 나오면 10:40 에 FVG 중간값 지정가 진입.
+        예) B + F: B 가 09:20 에 나고 F 셋업이 10:40 에 나오면 10:40 에 FVG 중간값 지정가 진입.
         전략마다 진입 시간대가 다르므로 AND 는 신호가 크게 줄어든다.
 
 모든 전략은 매 봉을 계속 받는다 (각자 하루 1회 신호). 종목당 실제 진입 1회 제한은 엔진이 한다.
@@ -32,12 +32,12 @@ from python_app.strategy.smc import SmcChochFvg
 logger = logging.getLogger("Korea3MinBreakoutTrader.Strategy")
 
 STRATEGY_LABELS: Dict[str, str] = {
-    "open_breakout": "첫 봉 시가 돌파",
-    "orb_high": "A. 첫 봉 고가 돌파",
-    "vwap_pullback": "B. VWAP 눌림 반등",
-    "prev_high": "C. 전일 고가 돌파",
-    "day_swing_high": "D. 당일 전고점 돌파",
-    "smc_fvg": "SMC CHoCH→FVG",
+    "open_breakout": "A. 첫 봉 시가 돌파",
+    "orb_high": "B. 첫 봉 고가 돌파",
+    "vwap_pullback": "C. VWAP 눌림 반등",
+    "prev_high": "D. 전일 고가 돌파",
+    "day_swing_high": "E. 당일 전고점 돌파",
+    "smc_fvg": "F. SMC CHoCH→FVG",
 }
 STRATEGY_KEYS: List[str] = list(STRATEGY_LABELS)
 

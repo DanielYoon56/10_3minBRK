@@ -59,7 +59,7 @@ def floor_to_tick(price: float) -> int:
 
 class SmcChochFvg(BarStrategy):
     key = "smc_fvg"
-    label = "SMC CHoCH→FVG"
+    label = "F.SMC CHoCH→FVG"
     signal_type = SignalType.BUY_SMC_FVG
 
     def _apply_config(self):

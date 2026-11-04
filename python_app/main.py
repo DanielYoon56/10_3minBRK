@@ -563,12 +563,12 @@ class MainWindow(QMainWindow):
         self.spn_dsh_trail = dspin(1.0, 90.0, 5.0, c.dsh_trail_retrace_rate)
         self.spn_dsh_act = dspin(0.0, 20.0, 0.1, c.dsh_trail_activation_rate)
         rows = [
-            ("B. VWAP 진입 마감", self.te_vwap_end, "SMC 목표 (R 배수, 3 = 3R)", self.spn_rr),
-            ("SMC 진입 시작", self.te_smc_start, "SMC 진입 마감", self.te_smc_end),
-            ("SMC 손절 기준", self.cmb_stop_mode, None, self.chk_smc_trail),
-            ("D. 진입 시작", self.te_dsh_start, "D. 진입 마감", self.te_dsh_end),
-            ("D. 손절 (-%)", self.spn_dsh_stop, "D. 상승분 되돌림 (%)", self.spn_dsh_trail),
-            ("D. 트레일링 발동 (+%)", self.spn_dsh_act, None, QLabel("")),
+            ("C. VWAP 진입 마감", self.te_vwap_end, "F. SMC 목표 (R 배수, 3 = 3R)", self.spn_rr),
+            ("F. SMC 진입 시작", self.te_smc_start, "F. SMC 진입 마감", self.te_smc_end),
+            ("F. SMC 손절 기준", self.cmb_stop_mode, None, self.chk_smc_trail),
+            ("E. 진입 시작", self.te_dsh_start, "E. 진입 마감", self.te_dsh_end),
+            ("E. 손절 (-%)", self.spn_dsh_stop, "E. 상승분 되돌림 (%)", self.spn_dsh_trail),
+            ("E. 트레일링 발동 (+%)", self.spn_dsh_act, None, QLabel("")),
         ]
         for r, (l1, w1, l2, w2) in enumerate(rows, start=3):
             g.addWidget(QLabel(l1), r, 0); g.addWidget(w1, r, 1)
@@ -582,7 +582,7 @@ class MainWindow(QMainWindow):
         self.spn_rr.valueChanged.connect(self.on_settings_changed)
         self.cmb_stop_mode.currentIndexChanged.connect(self.on_settings_changed)
         self.chk_smc_trail.toggled.connect(self.on_settings_changed)
-        note = QLabel("A·C 는 위 '신규 진입 시작~마감', B 는 시작~VWAP 마감, SMC·D 는 자체 시간대를 씁니다. "
+        note = QLabel("A·B·D 는 위 '신규 진입 시작~마감', C 는 시작~VWAP 마감, E·F 는 자체 시간대를 씁니다. "
                       "AND 는 신호가 크게 줄어듭니다. 세부값(눌림 폭·손절폭 범위·지정가 유효 봉 수)은 config.json")
         note.setStyleSheet("color: #8b949e;")
         note.setWordWrap(True)

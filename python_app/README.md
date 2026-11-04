@@ -54,19 +54,19 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
 
   | 키 | 전략 | 신호 | 진입 |
   |---|---|---|---|
-  | `open_breakout` | 첫 봉 시가 돌파 (기존) | 위 설명 | 시장가 |
-  | `orb_high` | A. 첫 봉 고가 돌파 | 직전 봉 종가 ≤ 첫 봉 고가 < 현재 봉 종가 + 거래량 조건 | 시장가 |
-  | `vwap_pullback` | B. VWAP 눌림 반등 | 고가가 VWAP +1% 이상 간 뒤, 저가가 VWAP ±0.3% 안으로 눌리고 양봉·VWAP 위 마감 | 시장가 |
-  | `prev_high` | C. 전일 고가 돌파 | 직전 봉 종가 ≤ 전일 고가 < 현재 봉 종가 + 거래량 조건 (전일 고가는 일봉 ka10081) | 시장가 |
-  | `day_swing_high` | D. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 체결가 -`dsh_stop_rate`(0.5)% 손절, 최고가 +`dsh_trail_activation_rate`(0.5)% 이후 상승분의 `dsh_trail_retrace_rate`(50)% 되돌림 시 청산 (전역 손절·트레일링과 별개). 시간대 `dsh_start_time`~`dsh_end_time` | 시장가 |
-  | `smc_fvg` | SMC CHoCH → FVG | 하락 구조(스윙 저점 아래 마감) 뒤 스윙 고점 위 마감 = CHoCH → 그 뒤 처음 완성되는 상승 FVG | **FVG 중간값 지정가** |
+  | `open_breakout` | A. 첫 봉 시가 돌파 (기존) | 위 설명 | 시장가 |
+  | `orb_high` | B. 첫 봉 고가 돌파 | 직전 봉 종가 ≤ 첫 봉 고가 < 현재 봉 종가 + 거래량 조건 | 시장가 |
+  | `vwap_pullback` | C. VWAP 눌림 반등 | 고가가 VWAP +1% 이상 간 뒤, 저가가 VWAP ±0.3% 안으로 눌리고 양봉·VWAP 위 마감 | 시장가 |
+  | `prev_high` | D. 전일 고가 돌파 | 직전 봉 종가 ≤ 전일 고가 < 현재 봉 종가 + 거래량 조건 (전일 고가는 일봉 ka10081) | 시장가 |
+  | `day_swing_high` | E. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 체결가 -`dsh_stop_rate`(0.5)% 손절, 최고가 +`dsh_trail_activation_rate`(0.5)% 이후 상승분의 `dsh_trail_retrace_rate`(50)% 되돌림 시 청산 (전역 손절·트레일링과 별개). 시간대 `dsh_start_time`~`dsh_end_time` | 시장가 |
+  | `smc_fvg` | F. SMC CHoCH → FVG | 하락 구조(스윙 저점 아래 마감) 뒤 스윙 고점 위 마감 = CHoCH → 그 뒤 처음 완성되는 상승 FVG | **FVG 중간값 지정가** |
 
   - **OR**: 하나라도 신호가 나면 진입 (같은 봉에 여럿이면 위 표 순서가 우선).
   - **AND**: 선택한 전략이 **당일 모두** 한 번 이상 신호를 낸 시점(마지막 신호 봉)에 진입. 진입 방식·손절·목표는 마지막 신호 것을 쓴다. 신호가 크게 줄어든다.
-  - 시간대: A·C·시가 돌파 = `trade_start_time`~`trade_end_time`, B = `trade_start_time`~`vwap_end_time`, SMC = `smc_start_time`~`smc_end_time`. 엔진은 가장 늦은 마감까지 3분봉을 조회한다.
+  - 시간대: A·B·D = `trade_start_time`~`trade_end_time`, C = `trade_start_time`~`vwap_end_time`, E = `dsh_start_time`~`dsh_end_time`, F = `smc_start_time`~`smc_end_time`. 엔진은 가장 늦은 마감까지 3분봉을 조회한다.
   - 종목당 진입은 하루 1회 (`allow_reentry_same_day=false`). 엔진을 다시 켜도 그날 청산한 종목은 다시 사지 않는다.
 
-  **SMC 세부** (봉은 당일 3분봉만 사용)
+  **F. SMC 세부** (봉은 당일 3분봉만 사용)
   - 스윙 고/저점: 좌우 `smc_swing_len`(2)봉보다 높/낮은 봉. 하락 구조 없이 위로 깨는 것은 BOS 로 보고 진입하지 않는다.
   - CHoCH 이후 **첫 FVG 하나만** 본다. 이 FVG 가 손절폭 조건을 못 맞추면 그 CHoCH 는 건너뛴다.
   - 진입가 = FVG 중간값(호가 단위 내림), 손절가 = 보호 저점(마지막 하락 전환 ~ CHoCH 사이 최저가) − 1호가 (`smc_stop_mode="fvg"` 면 FVG 하단 − 1호가)

@@ -10,12 +10,12 @@ from typing import Optional, List, Dict, Any
 
 
 class SignalType(str, Enum):
-    BUY_BREAKOUT = "BUY_BREAKOUT"            # 첫 3분봉 시가 돌파 (기본 전략)
-    BUY_ORB_HIGH = "BUY_ORB_HIGH"            # A. 첫 3분봉 고가 돌파
-    BUY_VWAP_PULLBACK = "BUY_VWAP_PULLBACK"  # B. VWAP 눌림 반등
-    BUY_PREV_HIGH = "BUY_PREV_HIGH"          # C. 전일 고가 돌파
-    BUY_DAY_SWING_HIGH = "BUY_DAY_SWING_HIGH"  # D. 당일 전고점(스윙 고점) 돌파
-    BUY_SMC_FVG = "BUY_SMC_FVG"              # SMC: CHoCH 후 첫 FVG 중간값 지정가 진입
+    BUY_BREAKOUT = "BUY_BREAKOUT"            # A. 첫 3분봉 시가 돌파 (기본 전략)
+    BUY_ORB_HIGH = "BUY_ORB_HIGH"            # B. 첫 3분봉 고가 돌파
+    BUY_VWAP_PULLBACK = "BUY_VWAP_PULLBACK"  # C. VWAP 눌림 반등
+    BUY_PREV_HIGH = "BUY_PREV_HIGH"          # D. 전일 고가 돌파
+    BUY_DAY_SWING_HIGH = "BUY_DAY_SWING_HIGH"  # E. 당일 전고점(스윙 고점) 돌파
+    BUY_SMC_FVG = "BUY_SMC_FVG"              # F. SMC: CHoCH 후 첫 FVG 중간값 지정가 진입
     SELL_STOP_LOSS = "SELL_STOP_LOSS"
     SELL_TAKE_PROFIT = "SELL_TAKE_PROFIT"
     SELL_TRAILING_STOP = "SELL_TRAILING_STOP"
@@ -249,18 +249,18 @@ class StrategyConfig:
     min_volume_ratio: float = 0.7           # 돌파 봉 거래량 > 첫 3분봉 거래량 × 0.7 (70% 초과)
 
     # 매수 전략 조합 (strategy/combiner.py)
-    #   open_breakout = 첫 봉 시가 돌파 / orb_high = A. 첫 봉 고가 돌파 / vwap_pullback = B. VWAP 눌림 반등
-    #   prev_high = C. 전일 고가 돌파 / day_swing_high = D. 당일 전고점 돌파
-    #   smc_fvg = SMC CHoCH → 첫 FVG 중간값 지정가
+    #   open_breakout = A. 첫 봉 시가 돌파 / orb_high = B. 첫 봉 고가 돌파 / vwap_pullback = C. VWAP 눌림 반등
+    #   prev_high = D. 전일 고가 돌파 / day_swing_high = E. 당일 전고점 돌파
+    #   smc_fvg = F. SMC CHoCH → 첫 FVG 중간값 지정가
     entry_strategies: List[str] = field(default_factory=lambda: ["open_breakout"])
     entry_logic: str = "OR"                 # OR = 하나라도 신호 → 진입 / AND = 선택 전략이 당일 모두 신호를 낸 시점에 진입
 
-    # B. VWAP 눌림 반등 (진입 시작은 trade_start_time)
+    # C. VWAP 눌림 반등 (진입 시작은 trade_start_time)
     vwap_end_time: str = "11:00"            # 신규 진입 마감
     vwap_trend_pct: float = 1.0             # 눌림 전에 고가가 VWAP보다 N% 이상 위에 있었어야 함 (추세 확인)
     vwap_touch_pct: float = 0.3             # 저가가 VWAP ±N% 안까지 내려오면 '눌림'
 
-    # D. 당일 전고점 돌파: 자체 손절·트레일링 (전역 stop_loss_rate / trailing_* 와 별개)
+    # E. 당일 전고점 돌파: 자체 손절·트레일링 (전역 stop_loss_rate / trailing_* 와 별개)
     dsh_start_time: str = "09:30"
     dsh_end_time: str = "14:00"
     dsh_swing_len: int = 2                  # 전고점 판정: 좌우 N봉보다 고가가 높아야 함
@@ -268,7 +268,7 @@ class StrategyConfig:
     dsh_trail_retrace_rate: float = 50.0    # 상승분(최고가-체결가)의 N% 되돌림 시 청산
     dsh_trail_activation_rate: float = 0.5  # 최고가가 +N% 이상 가야 트레일링 적용 (그 전에는 손절만)
 
-    # SMC: CHoCH → 첫 FVG 중간값 지정가 진입, 목표 = 진입가 + R × smc_rr
+    # F. SMC: CHoCH → 첫 FVG 중간값 지정가 진입, 목표 = 진입가 + R × smc_rr
     smc_start_time: str = "09:30"
     smc_end_time: str = "14:00"
     smc_swing_len: int = 2                  # 스윙 고/저점 판정: 좌우 N봉보다 높/낮아야 함

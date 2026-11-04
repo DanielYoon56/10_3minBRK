@@ -630,7 +630,7 @@ class LiveTradingEngine:
 
     # ================================================================ 진입
     def _prev_day_high(self, symbol: str, trade_date: str) -> Optional[float]:
-        """C. 전일 고가 돌파용 — 일봉(ka10081)에서 trade_date 직전 거래일 고가 (전략이 종목·날짜별로 캐시)"""
+        """D. 전일 고가 돌파용 — 일봉(ka10081)에서 trade_date 직전 거래일 고가 (전략이 종목·날짜별로 캐시)"""
         rows = [r for r in self.broker.get_daily_bars(symbol, trade_date) if r["dt"] < trade_date]
         return rows[-1]["high"] if rows else None
 
