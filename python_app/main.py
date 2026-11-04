@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QLabel, QPushButton, QLineEdit, QSpinBox,
     QDoubleSpinBox, QTimeEdit, QTabWidget, QGroupBox, QSplitter, QTextEdit,
     QStatusBar, QHeaderView, QMessageBox, QButtonGroup, QInputDialog, QCheckBox, QComboBox,
+    QScrollArea, QFrame,
 )
 
 # run.bat / "python main.py" 처럼 python_app 폴더 안에서 실행해도 패키지 임포트가 되도록 상위 폴더 등록
@@ -38,7 +39,8 @@ from python_app.broker.kiwoom_rest import KiwoomRestBroker
 from python_app.db.storage import DatabaseManager
 from python_app.engine.live_engine import LiveTradingEngine, kst_now
 from python_app.models.types import TradingMode
-from python_app.strategy.exit_rules import trailing_stop_price
+from python_app.strategy.combiner import STRATEGY_KEYS, STRATEGY_LABELS
+from python_app.strategy.exit_rules import trade_config, trailing_stop_price
 
 LOG_DIR = os.path.join(APP_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -213,6 +215,14 @@ class ScanWorker(QThread):
             self.done.emit(None, str(e))
 
 
+def _scrollable(widget: QWidget) -> QScrollArea:
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setWidget(widget)
+    return area
+
+
 def _item(text, align=Qt.AlignCenter, color: str = ""):
     it = QTableWidgetItem(str(text))
     it.setTextAlignment(align)
@@ -228,7 +238,8 @@ class MainWindow(QMainWindow):
         self.autostart = autostart
         self._force_close = False
         self._start_retries = 0
-        self.resize(1440, 900)
+        avail = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1440, avail.width()), min(900, avail.height() - 40))   # 작은 화면이면 화면에 맞춤
 
         self.cfg = load_config()
         self.config = strategy_config_from(self.cfg)
@@ -344,15 +355,18 @@ class MainWindow(QMainWindow):
         self.table_trades.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_trades.verticalHeader().setVisible(False)
         tabs.addTab(self.table_trades, "당일 매매")
+        tabs.addTab(self._build_daily_tab(), "일별 누적수익")
 
-        tabs.addTab(self._build_strategy_tab(), "전략 설정")
-        tabs.addTab(self._build_api_tab(), "키움 API 설정")
-        tabs.addTab(self._build_automation_tab(), "알림·자동실행")
+        # 설정 탭은 스크롤 영역에 넣는다 — 작은 화면(1280×720 등)에서도 창이 화면 밖으로 잘리지 않게
+        tabs.addTab(_scrollable(self._build_strategy_tab()), "전략 설정")
+        tabs.addTab(_scrollable(self._build_api_tab()), "키움 API 설정")
+        tabs.addTab(_scrollable(self._build_automation_tab()), "알림·자동실행")
 
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         tabs.addTab(self.txt_log, "실행 로그")
         self.tabs = tabs
+        tabs.currentChanged.connect(lambda i: tabs.widget(i) is self.daily_tab and self.refresh_daily())
 
         splitter.addWidget(tabs)
         splitter.setSizes([560, 880])
@@ -360,6 +374,71 @@ class MainWindow(QMainWindow):
 
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
+
+    def _build_daily_tab(self) -> QWidget:
+        self.daily_tab = w = QWidget()
+        lay = QVBoxLayout(w)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("구분"))
+        self.cmb_daily_mode = QComboBox()
+        for mode, label in ((TradingMode.MOCK, "모의거래"), (TradingMode.REAL, "실거래")):
+            self.cmb_daily_mode.addItem(label, mode.value)
+        self.cmb_daily_mode.setCurrentIndex(self.cmb_daily_mode.findData(self.mode.value))
+        self.cmb_daily_mode.currentIndexChanged.connect(self.refresh_daily)
+        top.addWidget(self.cmb_daily_mode)
+        btn = QPushButton("새로고침")
+        btn.clicked.connect(self.refresh_daily)
+        top.addWidget(btn)
+        top.addSpacing(16)
+        self.lbl_daily_sum = QLabel()
+        self.lbl_daily_sum.setFont(QFont("Malgun Gothic", 11, QFont.DemiBold))
+        top.addWidget(self.lbl_daily_sum)
+        top.addStretch()
+        lay.addLayout(top)
+
+        self.table_daily = QTableWidget(0, 7)
+        self.table_daily.setHorizontalHeaderLabels(["날짜", "청산 거래", "승 / 패", "승률", "당일 손익", "당일 수익률", "누적 손익"])
+        self.table_daily.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_daily.verticalHeader().setVisible(False)
+        lay.addWidget(self.table_daily)
+        note = QLabel("※ 추정 실현손익(수수료·세금 추정 차감) 기준. 수익률 = 당일 손익 ÷ 당일 청산 종목 매입금액.")
+        note.setStyleSheet("color: #8b949e;")
+        lay.addWidget(note)
+        self._daily_pnl_seen = None
+        self.refresh_daily()
+        return w
+
+    def refresh_daily(self, *_):
+        rows = self.db.get_daily_pnl(self.cmb_daily_mode.currentData())
+
+        def color(v):
+            return "#ff7b72" if v > 0 else "#79c0ff" if v < 0 else ""
+
+        self.table_daily.setRowCount(len(rows))
+        for r, d in enumerate(reversed(rows)):      # 최근 날짜가 위
+            day = d["trade_date"]
+            pnl = d["realized_pnl"]
+            decided = d["wins"] + d["losses"]
+            vals = (
+                (f"{day[:4]}-{day[4:6]}-{day[6:]}", ""),
+                (f"{d['trades']:,}", ""),
+                (f"{d['wins']} / {d['losses']}", ""),
+                (f"{d['wins'] / decided * 100:.0f}%" if decided else "-", ""),
+                (f"{pnl:+,.0f}원", color(pnl)),
+                (f"{pnl / d['invested'] * 100:+.2f}%" if d["invested"] else "-", color(pnl)),
+                (f"{d['cum_pnl']:+,.0f}원", color(d["cum_pnl"])),
+            )
+            for c, (v, col) in enumerate(vals):
+                self.table_daily.setItem(r, c, _item(v, color=col))
+
+        total = rows[-1]["cum_pnl"] if rows else 0.0
+        trades = sum(d["trades"] for d in rows)
+        wins = sum(d["wins"] for d in rows)
+        decided = wins + sum(d["losses"] for d in rows)
+        self.lbl_daily_sum.setText(
+            f"누적 손익 {total:+,.0f}원 · {len(rows)}거래일 · 청산 {trades}건"
+            + (f" · 승률 {wins / decided * 100:.0f}%" if decided else ""))
+        self.lbl_daily_sum.setStyleSheet(f"color: {color(total) or '#c9d1d9'};")
 
     def _build_strategy_tab(self) -> QWidget:
         w = QWidget()
@@ -399,6 +478,8 @@ class MainWindow(QMainWindow):
         self.te_eod = tedit(c.eod_liquidation_time)
         self.chk_carry = QCheckBox("앱이 꺼져 청산 못 한 종목은 다음 날 09:00 시장가 청산")
         self.chk_carry.setChecked(c.carryover_sell_at_open)
+        self.chk_no_reentry = QCheckBox("당일 재진입 금지 (청산한 종목은 그날 다시 매수 안 함)")
+        self.chk_no_reentry.setChecked(not c.allow_reentry_same_day)
 
         rows = [
             ("신규 진입 시작", self.te_start, "신규 진입 마감", self.te_end),
@@ -418,24 +499,95 @@ class MainWindow(QMainWindow):
             wdg.valueChanged.connect(self.on_settings_changed)
         g.addWidget(self.chk_eod, len(rows), 0, 1, 2)
         g.addWidget(self.chk_carry, len(rows), 2, 1, 2)
+        g.addWidget(self.chk_no_reentry, len(rows) + 1, 0, 1, 2)
         for wdg in (self.te_start, self.te_end, self.te_eod):
             wdg.timeChanged.connect(self.on_settings_changed)
-        for wdg in (self.chk_eod, self.chk_carry):
+        for wdg in (self.chk_eod, self.chk_carry, self.chk_no_reentry):
             wdg.toggled.connect(self.on_settings_changed)
         lay.addWidget(box)
 
+        lay.addWidget(self._build_entry_box(tedit, dspin))
         lay.addWidget(self._build_screener_box())
 
         info = QLabel(
             "★ 감시종목: 키움 조건식 결과 중 전일 매집(① 거래량 급증·양봉·고가 근처 마감  또는  ② 외국인·기관 동시 순매수 상위) 종목\n"
-            "★ 매수: 3분봉 종가가 첫 3분봉 시가(당일 시가)를 상향 돌파 + 돌파 봉 거래량 > 첫 봉 거래량 × 배수\n"
+            "★ 매수: 위 '매수 전략'에서 선택한 전략을 OR(하나라도) / AND(당일 모두 충족) 로 조합 — 시장가 진입 (SMC 만 FVG 중간값 지정가)\n"
             "★ 매도: ① 매입가 대비 손절  ② +1% 이상 오른 뒤 최고가까지 상승분의 N%를 되돌리면 전량 시장가 청산  ③ 장 마감 전 일괄 청산\n"
+            "   (SMC 진입분: 전략 손절가 / 목표가(R 배수)로 청산, 트레일링은 체크 시에만)\n"
             "★ 주의: 감시·매도는 이 앱이 켜져 있을 때만 작동합니다 (PC 절전·종료 시 중단)\n"
             "★ 안전: 앱이 매수한 종목만 청산 · 늦게 시작하면 지나간 신호는 매수 안 함 · 일 손실한도 도달 시 신규 매수 중단")
         info.setStyleSheet("color: #8b949e;")
         lay.addWidget(info)
         lay.addStretch()
         return w
+
+    def _build_entry_box(self, tedit, dspin) -> QWidget:
+        c = self.config
+        box = QGroupBox("매수 전략 (복수 선택 + 조합, 변경 즉시 적용·저장)")
+        g = QGridLayout(box)
+        self.chk_strats = {}
+        hints = {
+            "open_breakout": "첫 3분봉 시가 상향 돌파 + 거래량",
+            "orb_high": "첫 3분봉 고가 상향 돌파 + 거래량 (갭상승 종목)",
+            "vwap_pullback": "VWAP 위 추세 → VWAP 근처 눌림 후 양봉 반등",
+            "prev_high": "전일 일봉 고가 상향 돌파 + 거래량",
+            "day_swing_high": "당일 스윙 고점 상향 돌파 + 거래량, 자체 손절·트레일링",
+            "smc_fvg": "하락 구조 → CHoCH → 첫 FVG 중간값 지정가, 목표 R 배수",
+        }
+        for i, key in enumerate(STRATEGY_KEYS):
+            chk = QCheckBox(STRATEGY_LABELS[key])
+            chk.setChecked(key in c.entry_strategies)
+            chk.setToolTip(hints[key])
+            chk.toggled.connect(self.on_settings_changed)
+            self.chk_strats[key] = chk
+            g.addWidget(chk, i // 3, i % 3)
+        self.cmb_logic = QComboBox()
+        self.cmb_logic.addItems(["OR — 하나라도 신호 시 진입", "AND — 선택 전략 모두 당일 신호 시 진입"])
+        self.cmb_logic.setCurrentIndex(1 if str(c.entry_logic).upper() == "AND" else 0)
+        self.cmb_logic.currentIndexChanged.connect(self.on_settings_changed)
+        g.addWidget(QLabel("조합"), 2, 0)
+        g.addWidget(self.cmb_logic, 2, 1)
+
+        self.te_vwap_end = tedit(c.vwap_end_time)
+        self.te_smc_start = tedit(c.smc_start_time)
+        self.te_smc_end = tedit(c.smc_end_time)
+        self.spn_rr = dspin(1.0, 10.0, 0.5, c.smc_rr)
+        self.cmb_stop_mode = QComboBox()
+        self.cmb_stop_mode.addItems(["보호 저점(CHoCH 레그 최저가) 아래", "FVG 하단 아래"])
+        self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
+        self.chk_smc_trail = QCheckBox("SMC 진입분도 트레일링 스탑 적용")
+        self.chk_smc_trail.setChecked(c.smc_use_trailing)
+        self.te_dsh_start = tedit(c.dsh_start_time)
+        self.te_dsh_end = tedit(c.dsh_end_time)
+        self.spn_dsh_stop = dspin(0.1, 10.0, 0.1, c.dsh_stop_rate)
+        self.spn_dsh_trail = dspin(1.0, 90.0, 5.0, c.dsh_trail_retrace_rate)
+        self.spn_dsh_act = dspin(0.0, 20.0, 0.1, c.dsh_trail_activation_rate)
+        rows = [
+            ("B. VWAP 진입 마감", self.te_vwap_end, "SMC 목표 (R 배수, 3 = 3R)", self.spn_rr),
+            ("SMC 진입 시작", self.te_smc_start, "SMC 진입 마감", self.te_smc_end),
+            ("SMC 손절 기준", self.cmb_stop_mode, None, self.chk_smc_trail),
+            ("D. 진입 시작", self.te_dsh_start, "D. 진입 마감", self.te_dsh_end),
+            ("D. 손절 (-%)", self.spn_dsh_stop, "D. 상승분 되돌림 (%)", self.spn_dsh_trail),
+            ("D. 트레일링 발동 (+%)", self.spn_dsh_act, None, QLabel("")),
+        ]
+        for r, (l1, w1, l2, w2) in enumerate(rows, start=3):
+            g.addWidget(QLabel(l1), r, 0); g.addWidget(w1, r, 1)
+            if l2:
+                g.addWidget(QLabel(l2), r, 2)
+            g.addWidget(w2, r, 3)
+        for te in (self.te_vwap_end, self.te_smc_start, self.te_smc_end, self.te_dsh_start, self.te_dsh_end):
+            te.timeChanged.connect(self.on_settings_changed)
+        for spn in (self.spn_dsh_stop, self.spn_dsh_trail, self.spn_dsh_act):
+            spn.valueChanged.connect(self.on_settings_changed)
+        self.spn_rr.valueChanged.connect(self.on_settings_changed)
+        self.cmb_stop_mode.currentIndexChanged.connect(self.on_settings_changed)
+        self.chk_smc_trail.toggled.connect(self.on_settings_changed)
+        note = QLabel("A·C 는 위 '신규 진입 시작~마감', B 는 시작~VWAP 마감, SMC·D 는 자체 시간대를 씁니다. "
+                      "AND 는 신호가 크게 줄어듭니다. 세부값(눌림 폭·손절폭 범위·지정가 유효 봉 수)은 config.json")
+        note.setStyleSheet("color: #8b949e;")
+        note.setWordWrap(True)
+        g.addWidget(note, len(rows) + 3, 0, 1, 4)
+        return box
 
     def _build_screener_box(self) -> QWidget:
         sc = self.cfg["screener"]
@@ -701,7 +853,7 @@ class MainWindow(QMainWindow):
 
         # --- 자동 실행
         au = self.cfg["autostart"]
-        au_box = QGroupBox("자동 실행 (평일 08:50 Windows 작업 스케줄러)")
+        au_box = QGroupBox("자동 실행 (평일 08:00 Windows 작업 스케줄러)")
         ag = QGridLayout(au_box)
         self.chk_auto_trade = QCheckBox("자동 실행으로 켜지면 자동매매까지 자동 시작")
         self.chk_auto_trade.setChecked(bool(au.get("auto_start_trading", True)))
@@ -730,7 +882,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(au_box)
 
         help_lbl = QLabel(
-            "· 등록하면 평일 08:50에 PC가 절전 중이어도 깨워서 앱을 실행합니다.\n"
+            "· 등록하면 평일 08:00에 PC가 절전 중이어도 깨워서 앱을 실행합니다.\n"
             "  단, '절전 모드 해제 타이머 허용'이 '사용'이어야 합니다 (Windows 설정 앱엔 없음):\n"
             "  Win+R → control powercfg.cpl → 설정 변경 → 고급 전원 관리 옵션 설정 변경 → 절전 → 절전 모드 해제 타이머 허용\n"
             "· PC가 꺼져 있다가 나중에 켜지면 그때 실행됩니다. 이미 지나간 신호로는 매수하지 않습니다.\n"
@@ -823,7 +975,7 @@ class MainWindow(QMainWindow):
             self.btn_task_on.setEnabled(False); self.btn_task_off.setEnabled(False)
             return
         on = self._schtasks_query()
-        self.lbl_task.setText(f"Windows 자동 시작: {'✅ 등록됨 (평일 08:50)' if on else '미등록'}")
+        self.lbl_task.setText(f"Windows 자동 시작: {'✅ 등록됨 (평일 08:00)' if on else '미등록'}")
 
     def set_windows_task(self, enable: bool):
         script = os.path.join(ROOT_DIR, "tools", "autostart.ps1")
@@ -888,6 +1040,7 @@ class MainWindow(QMainWindow):
             self.lbl_banner.setText("모의거래 모드 — 키움 모의투자 서버 (실제 돈 사용 안 함)")
             self.lbl_banner.setStyleSheet("background:#0c2d6b; color:#79c0ff; border:1px solid #1f6feb; border-radius:4px; padding:6px;")
         self.statusBar.showMessage(f"현재 모드: {'실거래' if self.mode == TradingMode.REAL else '모의거래'}")
+        self.cmb_daily_mode.setCurrentIndex(self.cmb_daily_mode.findData(self.mode.value))
 
     def on_mode_clicked(self, mode: TradingMode):
         if mode == self.mode:
@@ -963,6 +1116,22 @@ class MainWindow(QMainWindow):
         c.eod_liquidation = self.chk_eod.isChecked()
         c.eod_liquidation_time = self.te_eod.time().toString("HH:mm")
         c.carryover_sell_at_open = self.chk_carry.isChecked()
+        c.allow_reentry_same_day = not self.chk_no_reentry.isChecked()
+        c.entry_strategies = [k for k in STRATEGY_KEYS if self.chk_strats[k].isChecked()]
+        c.entry_logic = "AND" if self.cmb_logic.currentIndex() == 1 else "OR"
+        c.vwap_end_time = self.te_vwap_end.time().toString("HH:mm")
+        c.smc_start_time = self.te_smc_start.time().toString("HH:mm")
+        c.smc_end_time = self.te_smc_end.time().toString("HH:mm")
+        c.smc_rr = round(self.spn_rr.value(), 2)
+        c.smc_stop_mode = "fvg" if self.cmb_stop_mode.currentIndex() == 1 else "swing"
+        c.smc_use_trailing = self.chk_smc_trail.isChecked()
+        c.dsh_start_time = self.te_dsh_start.time().toString("HH:mm")
+        c.dsh_end_time = self.te_dsh_end.time().toString("HH:mm")
+        c.dsh_stop_rate = round(self.spn_dsh_stop.value(), 2)
+        c.dsh_trail_retrace_rate = round(self.spn_dsh_trail.value(), 2)
+        c.dsh_trail_activation_rate = round(self.spn_dsh_act.value(), 2)
+        if not c.entry_strategies:
+            self.append_log("warning", "매수 전략이 하나도 선택되지 않았습니다 — 신규 매수 없음")
         if self.engine:
             self.engine.strategy.update_config(c)
         update_strategy_fields(self.cfg, c)
@@ -994,6 +1163,7 @@ class MainWindow(QMainWindow):
                 f"· 1회 매수 금액: {c.order_amount_per_trade:,}원\n"
                 f"· 최대 동시 보유: {c.max_concurrent_positions}종목\n"
                 f"· 일 손실한도: {c.max_daily_loss:,}원\n"
+                f"· 당일 재진입: {'금지' if not c.allow_reentry_same_day else '허용'}\n"
                 f"· 손절 -{c.stop_loss_rate:g}% / 트레일링: +{c.trailing_activation_rate:g}% 이상 상승 후 상승분 {c.trailing_retrace_rate:g}% 되돌림\n"
                 f"· 장 마감 일괄 청산: {c.eod_liquidation_time if c.eod_liquidation else '사용 안 함'}\n\n"
                 "※ 감시·매도는 이 앱이 켜져 있는 동안만 작동합니다. PC 절전을 꺼 두세요.\n\n"
@@ -1084,6 +1254,9 @@ class MainWindow(QMainWindow):
         self.lbl_cash.setText(f"주문가능금액: {snap['cash']:,.0f}원")
         pnl = snap["realized_pnl"]
         self.lbl_pnl.setText(f"당일 추정 실현손익: {pnl:+,.0f}원")
+        if pnl != self._daily_pnl_seen:      # 청산 발생 → 일별 누적수익 탭 갱신
+            self._daily_pnl_seen = pnl
+            self.refresh_daily()
         self.lbl_pnl.setStyleSheet(f"color: {'#ff7b72' if pnl > 0 else '#79c0ff' if pnl < 0 else '#c9d1d9'};")
         active = sum(1 for m in snap["managed"].values() if m["status"] in ("BUYING", "HOLDING", "SELLING"))
         self.lbl_active.setText(f"관리 종목: {active} / {self.config.max_concurrent_positions}")
@@ -1132,15 +1305,22 @@ class MainWindow(QMainWindow):
             entry = (m["entry_price"] if managed and m["entry_price"] else p["avg_price"])
             cur = quotes.get(sym, p["current_price"])
             peak = max(m["highest_price"] if managed else p["highest_price"], entry)
-            trail = trailing_stop_price(entry, peak, self.config) if managed else None
+            trail = (trailing_stop_price(entry, peak, trade_config(self.config, m["trail_retrace_rate"],
+                                                                   m["trail_activation_rate"]))
+                     if managed and m["use_trailing"] else None)
+            stop = (m["stop_price"] or entry * (1 - self.config.stop_loss_rate / 100)) if managed else 0
+            if managed and not m["use_trailing"]:
+                trail_txt = f"목표 {m['target_price']:,.0f}" if m["target_price"] else "미적용"
+            else:
+                trail_txt = f"{trail:,.0f}" if trail else ("상승 대기" if managed else "-")
             rows.append((
                 f"{p['name']}({sym})",
                 "앱 매수" if managed else "기존 보유 · 관리 안 함",
                 f"{p['qty']:,}", f"{entry:,.0f}", f"{cur:,.0f}",
                 f"{(cur / entry - 1) * 100:+.2f}%" if entry else "-",
                 f"{peak:,.0f}" if managed else "-",
-                f"{entry * (1 - self.config.stop_loss_rate / 100):,.0f}" if managed else "-",
-                f"{trail:,.0f}" if trail else ("상승 대기" if managed else "-"),
+                f"{stop:,.0f}" if managed else "-",
+                trail_txt,
                 {"HOLDING": "보유", "SELLING": "매도 주문중", "BUYING": "매수 주문중"}.get(m["status"], "-") if managed else "-",
             ))
         self.table_pos.setRowCount(len(rows))

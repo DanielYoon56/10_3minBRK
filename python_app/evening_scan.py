@@ -1,10 +1,10 @@
 """
-Korea3MinBreakoutTrader - 18시 매집 확인 스캔 (장 마감 후, 앱과 별도 실행)
+Korea3MinBreakoutTrader - 20시 매집 확인 스캔 (장 마감 후, 앱과 별도 실행)
 
 - 오늘 확정 일봉으로 매집 종목(① 거래량·캔들 OR ② 외국인 AND 기관 순매수)을 골라
   콘솔에 표시하고 텔레그램으로 보낸다. 기준 수치는 config.json 의 screener 설정 그대로.
 - 결과는 screen_다음평일.json 으로 저장 → 다음 날 아침 앱이 감시종목으로 그대로 재사용
-- 평일 18:00 작업 스케줄러 등록: evening_scan_install.bat
+- 평일 20:00 작업 스케줄러 등록: evening_scan_install.bat
 
   python python_app/evening_scan.py [--pause] [--no-telegram] [--force]
 """
@@ -36,7 +36,7 @@ def _fmt_date(d: str) -> str:
 def format_result(res: ScreenResult, mode_label: str) -> str:
     n1 = sum("①" in h.reasons for h in res.hits)
     n2 = sum(any(r.startswith("②") for r in h.reasons) for h in res.hits)
-    lines = [f"📋 18시 매집 스캔 [{mode_label}] 기준일 {_fmt_date(res.prev_date)}",
+    lines = [f"📋 20시 매집 스캔 [{mode_label}] 기준일 {_fmt_date(res.prev_date)}",
              f"→ {_fmt_date(res.trade_date)} 감시종목 {len(res.hits)}개 (후보 {res.candidates_checked}) "
              f"[①거래량·캔들 {n1} / ②수급 {n2}]"]
     if not res.hits:
@@ -65,11 +65,11 @@ def _chunks(text: str, limit: int = 3800):
 def run(send_telegram: bool = True, force: bool = False) -> int:
     now = kst_now()
     if now.weekday() >= 5 and not force:
-        logger.info("주말 → 18시 매집 스캔 건너뜀")
+        logger.info("주말 → 20시 매집 스캔 건너뜀")
         return 0
     if now.time() < dtime(15, 40) and not force:
         # PC가 꺼져 있다 다음 날 아침 늦게 실행되면 오늘 봉이 미확정 → 잘못된 날짜로 저장되므로 건너뜀
-        logger.info("장 마감(15:40) 전 → 18시 매집 스캔 건너뜀 (오늘 일봉 미확정)")
+        logger.info("장 마감(15:40) 전 → 20시 매집 스캔 건너뜀 (오늘 일봉 미확정)")
         return 0
     cfg = load_config()
     mode = TradingMode(cfg["trading_mode"])
@@ -78,7 +78,7 @@ def run(send_telegram: bool = True, force: bool = False) -> int:
     enabled, token, chat = telegram_settings(cfg)
     notifier = TelegramNotifier(token, chat, enabled=enabled and send_telegram)
     if not broker.connect():
-        msg = f"⚠ 18시 매집 스캔 실패: 키움 {broker.mode_label} 접속 실패 — 앱키/시크릿키를 확인하세요"
+        msg = f"⚠ 20시 매집 스캔 실패: 키움 {broker.mode_label} 접속 실패 — 앱키/시크릿키를 확인하세요"
         logger.error(msg)
         if notifier.active:
             notifier.send_now(msg)
@@ -88,13 +88,13 @@ def run(send_telegram: bool = True, force: bool = False) -> int:
         broker, ScreenerConfig.from_dict(cfg.get("screener")), state_dir=APP_DIR,
         log=lambda lv, m: getattr(logger, lv if lv in ("info", "warning", "error") else "info")(m),
         condition_client_factory=lambda: KiwoomConditionClient(broker, raw_log_dir=LOG_DIR))
-    logger.info("🔍 18시 매집 스캔 시작 (오늘 확정 일봉 기준, 코스피·코스닥 전체)")
+    logger.info("🔍 20시 매집 스캔 시작 (오늘 확정 일봉 기준, 코스피·코스닥 전체)")
     try:
         res = screener.run(now, use_cache=False, after_close=True)
     except Exception as e:
-        logger.exception("18시 매집 스캔 오류")
+        logger.exception("20시 매집 스캔 오류")
         if notifier.active:
-            notifier.send_now(f"⚠ 18시 매집 스캔 실패: {e}")
+            notifier.send_now(f"⚠ 20시 매집 스캔 실패: {e}")
         return 1
 
     text = format_result(res, broker.mode_label)
@@ -108,7 +108,7 @@ def run(send_telegram: bool = True, force: bool = False) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="18시 매집 확인 스캔")
+    parser = argparse.ArgumentParser(description="20시 매집 확인 스캔")
     parser.add_argument("--pause", action="store_true", help="끝난 뒤 Enter 를 누를 때까지 창 유지")
     parser.add_argument("--no-telegram", action="store_true", help="텔레그램 전송 안 함")
     parser.add_argument("--force", action="store_true", help="주말·장 마감 전에도 실행")

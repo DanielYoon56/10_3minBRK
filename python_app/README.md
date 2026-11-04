@@ -49,6 +49,31 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
   | `take_profit_rate` | `0.0` | 고정 익절 % (0 = 끔) |
   | `use_first_bar_low_stop` | `false` | 첫 봉 저가 이탈 즉시 손절 병행 |
 
+#### 추가 매수 전략 + AND/OR 조합 (`strategy/combiner.py`, `intraday.py`, `smc.py`)
+  GUI [전략 설정] → '매수 전략'에서 여러 개를 고르고 조합을 정한다 (`entry_strategies`, `entry_logic`).
+
+  | 키 | 전략 | 신호 | 진입 |
+  |---|---|---|---|
+  | `open_breakout` | 첫 봉 시가 돌파 (기존) | 위 설명 | 시장가 |
+  | `orb_high` | A. 첫 봉 고가 돌파 | 직전 봉 종가 ≤ 첫 봉 고가 < 현재 봉 종가 + 거래량 조건 | 시장가 |
+  | `vwap_pullback` | B. VWAP 눌림 반등 | 고가가 VWAP +1% 이상 간 뒤, 저가가 VWAP ±0.3% 안으로 눌리고 양봉·VWAP 위 마감 | 시장가 |
+  | `prev_high` | C. 전일 고가 돌파 | 직전 봉 종가 ≤ 전일 고가 < 현재 봉 종가 + 거래량 조건 (전일 고가는 일봉 ka10081) | 시장가 |
+  | `day_swing_high` | D. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 체결가 -`dsh_stop_rate`(0.5)% 손절, 최고가 +`dsh_trail_activation_rate`(0.5)% 이후 상승분의 `dsh_trail_retrace_rate`(50)% 되돌림 시 청산 (전역 손절·트레일링과 별개). 시간대 `dsh_start_time`~`dsh_end_time` | 시장가 |
+  | `smc_fvg` | SMC CHoCH → FVG | 하락 구조(스윙 저점 아래 마감) 뒤 스윙 고점 위 마감 = CHoCH → 그 뒤 처음 완성되는 상승 FVG | **FVG 중간값 지정가** |
+
+  - **OR**: 하나라도 신호가 나면 진입 (같은 봉에 여럿이면 위 표 순서가 우선).
+  - **AND**: 선택한 전략이 **당일 모두** 한 번 이상 신호를 낸 시점(마지막 신호 봉)에 진입. 진입 방식·손절·목표는 마지막 신호 것을 쓴다. 신호가 크게 줄어든다.
+  - 시간대: A·C·시가 돌파 = `trade_start_time`~`trade_end_time`, B = `trade_start_time`~`vwap_end_time`, SMC = `smc_start_time`~`smc_end_time`. 엔진은 가장 늦은 마감까지 3분봉을 조회한다.
+  - 종목당 진입은 하루 1회 (`allow_reentry_same_day=false`). 엔진을 다시 켜도 그날 청산한 종목은 다시 사지 않는다.
+
+  **SMC 세부** (봉은 당일 3분봉만 사용)
+  - 스윙 고/저점: 좌우 `smc_swing_len`(2)봉보다 높/낮은 봉. 하락 구조 없이 위로 깨는 것은 BOS 로 보고 진입하지 않는다.
+  - CHoCH 이후 **첫 FVG 하나만** 본다. 이 FVG 가 손절폭 조건을 못 맞추면 그 CHoCH 는 건너뛴다.
+  - 진입가 = FVG 중간값(호가 단위 내림), 손절가 = 보호 저점(마지막 하락 전환 ~ CHoCH 사이 최저가) − 1호가 (`smc_stop_mode="fvg"` 면 FVG 하단 − 1호가)
+  - 목표가 = 진입가 + (진입가 − 손절가) × `smc_rr` (3 = 3R, 4 = 4R). 손절폭이 `smc_min_risk_pct`(0.3%) 미만·`smc_max_risk_pct`(3%) 초과면 생략.
+  - 지정가는 `smc_fvg_expiry_bars`(10봉 = 30분) 안에 체결 안 되면 취소, 체결 전 현재가가 손절가 이하로 내려가도 취소. 부분 체결 후 유효시간이 끝나면 잔량만 취소.
+  - 청산: 전략 손절가 / 목표가로만 (`smc_use_trailing=true` 면 트레일링도 적용), 장 마감 일괄 청산은 공통.
+
 ---
 
 ## 2. 키움증권 연동 (모의거래 / 실거래)
@@ -65,7 +90,7 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
    - 실거래로 바꾸려면 확인창에 `실거래`를 직접 입력해야 전환됩니다
    - 실거래 시작 시 매수금액·손실한도 요약을 보여주고 한 번 더 확인합니다
    - 자동매매 가동 중에는 모드를 바꿀 수 없습니다
-3. **자동매매 시작** — 장 시작 전(08:50 등)에 켜 두면 09:00부터 자동으로 동작합니다
+3. **자동매매 시작** — 장 시작 전(08:00 등)에 켜 두면 09:00부터 자동으로 동작합니다
 
 | 모드 | 서버 | 앱키 | 화면 |
 |---|---|---|---|
@@ -124,13 +149,16 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
 Korea3minTrader/
 ├── setup.bat / run.bat / run_console.bat     # 설치 · 실행 · 콘솔 실행(문제 확인용)
 ├── autostart_install.bat / autostart_uninstall.bat
-├── tools/autostart.ps1                       # 작업 스케줄러 등록 (평일 08:50, 절전 깨우기)
+├── tools/autostart.ps1                       # 작업 스케줄러 등록 (평일 08:00, 절전 깨우기)
 └── python_app/
     ├── main.py                 # GUI — 모의/실거래 전환, 키·알림·자동실행 설정, 현황판 (--autostart 지원)
     ├── app_config.py           # config.json 로드/저장 (앱키·텔레그램 토큰 포함, 공유 금지)
     ├── engine/live_engine.py   # 실시간 자동매매 루프 (분봉→신호→주문→청산→알림)
     ├── notify/telegram.py      # 텔레그램 알림 (백그라운드 전송)
     ├── strategy/breakout.py    # 3분봉 시가돌파 매수 판정
+    ├── strategy/intraday.py    # A 첫 봉 고가 / B VWAP 눌림 / C 전일 고가 돌파
+    ├── strategy/smc.py         # SMC CHoCH → 첫 FVG 중간값 지정가 (3R/4R)
+    ├── strategy/combiner.py    # 매수 전략 AND/OR 조합
     ├── strategy/exit_rules.py  # 손절 -2% / 트레일링 15%
     ├── broker/kiwoom_rest.py   # 키움증권 REST API (모의 mockapi / 실거래 api.kiwoom.com)
     ├── broker/kiwoom_condition.py  # 키움 조건검색 (웹소켓: LOGIN · CNSRLST · CNSRREQ)

@@ -10,7 +10,12 @@ from typing import Optional, List, Dict, Any
 
 
 class SignalType(str, Enum):
-    BUY_BREAKOUT = "BUY_BREAKOUT"
+    BUY_BREAKOUT = "BUY_BREAKOUT"            # 첫 3분봉 시가 돌파 (기본 전략)
+    BUY_ORB_HIGH = "BUY_ORB_HIGH"            # A. 첫 3분봉 고가 돌파
+    BUY_VWAP_PULLBACK = "BUY_VWAP_PULLBACK"  # B. VWAP 눌림 반등
+    BUY_PREV_HIGH = "BUY_PREV_HIGH"          # C. 전일 고가 돌파
+    BUY_DAY_SWING_HIGH = "BUY_DAY_SWING_HIGH"  # D. 당일 전고점(스윙 고점) 돌파
+    BUY_SMC_FVG = "BUY_SMC_FVG"              # SMC: CHoCH 후 첫 FVG 중간값 지정가 진입
     SELL_STOP_LOSS = "SELL_STOP_LOSS"
     SELL_TAKE_PROFIT = "SELL_TAKE_PROFIT"
     SELL_TRAILING_STOP = "SELL_TRAILING_STOP"
@@ -96,6 +101,18 @@ class Signal:
     bar_index: int = 0
     breakout_level: float = 0.0     # 돌파 기준가 (기본: 첫 3분봉 시가)
     stop_loss_price: float = 0.0    # 진입가 기준 손절가 (기본 -2%)
+    strategy: str = "open_breakout"  # 신호를 낸 전략 키 (AND 조합이면 'a+b')
+    order_type: Optional[OrderType] = None  # None → MARKET. SMC 는 LIMIT (FVG 중간값 지정가)
+    take_profit_price: float = 0.0   # 전략 고정 목표가 (SMC: 진입가 + R × 배수), 0 = 없음
+    use_trailing: bool = True        # False → 트레일링 스탑 미적용 (손절/목표가로만 청산)
+    expire_at: Optional[datetime] = None  # 지정가 주문 유효 시각 (지나면 미체결 취소)
+    stop_rate: float = 0.0           # 전략 손절 % — 실제 체결가 기준으로 손절가 계산 (0 = 전역 stop_loss_rate)
+    trail_retrace_rate: float = 0.0  # 전략 트레일링 되돌림 % (0 = 전역 설정)
+    trail_activation_rate: float = 0.0  # 전략 트레일링 발동 % (trail_retrace_rate > 0 일 때만 사용)
+
+    def __post_init__(self):
+        if self.order_type is None:
+            self.order_type = OrderType.MARKET
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -112,6 +129,14 @@ class Signal:
             "bar_index": self.bar_index,
             "breakout_level": self.breakout_level,
             "stop_loss_price": self.stop_loss_price,
+            "strategy": self.strategy,
+            "order_type": self.order_type.value,
+            "take_profit_price": self.take_profit_price,
+            "use_trailing": self.use_trailing,
+            "expire_at": self.expire_at.isoformat() if self.expire_at else None,
+            "stop_rate": self.stop_rate,
+            "trail_retrace_rate": self.trail_retrace_rate,
+            "trail_activation_rate": self.trail_activation_rate,
         }
 
 
@@ -222,3 +247,34 @@ class StrategyConfig:
     # 중복 신호 제어
     allow_reentry_same_day: bool = False    # 당일 동일 종목 재진입 허용 여부
     min_volume_ratio: float = 0.7           # 돌파 봉 거래량 > 첫 3분봉 거래량 × 0.7 (70% 초과)
+
+    # 매수 전략 조합 (strategy/combiner.py)
+    #   open_breakout = 첫 봉 시가 돌파 / orb_high = A. 첫 봉 고가 돌파 / vwap_pullback = B. VWAP 눌림 반등
+    #   prev_high = C. 전일 고가 돌파 / day_swing_high = D. 당일 전고점 돌파
+    #   smc_fvg = SMC CHoCH → 첫 FVG 중간값 지정가
+    entry_strategies: List[str] = field(default_factory=lambda: ["open_breakout"])
+    entry_logic: str = "OR"                 # OR = 하나라도 신호 → 진입 / AND = 선택 전략이 당일 모두 신호를 낸 시점에 진입
+
+    # B. VWAP 눌림 반등 (진입 시작은 trade_start_time)
+    vwap_end_time: str = "11:00"            # 신규 진입 마감
+    vwap_trend_pct: float = 1.0             # 눌림 전에 고가가 VWAP보다 N% 이상 위에 있었어야 함 (추세 확인)
+    vwap_touch_pct: float = 0.3             # 저가가 VWAP ±N% 안까지 내려오면 '눌림'
+
+    # D. 당일 전고점 돌파: 자체 손절·트레일링 (전역 stop_loss_rate / trailing_* 와 별개)
+    dsh_start_time: str = "09:30"
+    dsh_end_time: str = "14:00"
+    dsh_swing_len: int = 2                  # 전고점 판정: 좌우 N봉보다 고가가 높아야 함
+    dsh_stop_rate: float = 0.5              # 손절: 체결가 대비 -N%
+    dsh_trail_retrace_rate: float = 50.0    # 상승분(최고가-체결가)의 N% 되돌림 시 청산
+    dsh_trail_activation_rate: float = 0.5  # 최고가가 +N% 이상 가야 트레일링 적용 (그 전에는 손절만)
+
+    # SMC: CHoCH → 첫 FVG 중간값 지정가 진입, 목표 = 진입가 + R × smc_rr
+    smc_start_time: str = "09:30"
+    smc_end_time: str = "14:00"
+    smc_swing_len: int = 2                  # 스윙 고/저점 판정: 좌우 N봉보다 높/낮아야 함
+    smc_rr: float = 3.0                     # 목표 R 배수 (3R / 4R)
+    smc_stop_mode: str = "swing"            # swing = CHoCH 전 스윙 저점 아래 / fvg = FVG 하단 아래
+    smc_min_risk_pct: float = 0.3           # 손절폭(진입가 대비 %)이 이보다 작으면 생략 (수수료·호가 대비 의미 없음)
+    smc_max_risk_pct: float = 3.0           # 손절폭이 이보다 크면 생략
+    smc_fvg_expiry_bars: int = 10           # 지정가 대기 최대 봉 수 (10봉 = 30분)
+    smc_use_trailing: bool = False          # False = 손절/목표가(R)로만 청산

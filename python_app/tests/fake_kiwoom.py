@@ -35,7 +35,7 @@ class FakeKiwoom:
         self._ord_seq = 1000
         # 매집 스캔용
         self.prev_top: Dict[str, List[dict]] = {"1": [], "2": []}   # ka10031 qry_tp별 [{"stk_cd","stk_nm"}]
-        self.today_top: Dict[str, List[dict]] = {"1": [], "3": []}  # ka10030 sort_tp별 (18시 스캔)
+        self.today_top: Dict[str, List[dict]] = {"1": [], "3": []}  # ka10030 sort_tp별 (20시 스캔)
         self.daily: Dict[str, List[dict]] = {}                     # ka10081 sym → 최신순 일봉
         self.frgn_inst_rows: List[dict] = []                       # ka90009 행
         self.mac: Dict[str, str] = {}                              # ka10001 시가총액 (문자열 그대로)

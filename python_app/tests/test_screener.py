@@ -140,7 +140,7 @@ def test_today_bar_ignored_when_run_after_open(tmp_path):
 
 
 def test_after_close_uses_today_bar_and_saves_for_next_day(tmp_path):
-    """18시 스캔: 오늘(PREV=월) 봉이 판단일, 후보는 당일 상위, 결과는 다음 거래일(화) 파일로 저장"""
+    """20시 스캔: 오늘(PREV=월) 봉이 판단일, 후보는 당일 상위, 결과는 다음 거래일(화) 파일로 저장"""
     fake = FakeKiwoom()
     build_market(fake)
     fake.today_top["1"], fake.prev_top["1"] = fake.prev_top["1"], []

@@ -150,3 +150,118 @@ def test_daily_summary_once(tmp_path):
     summaries = [m for m in cap.msgs if "당일 마감 요약" in m]
     assert len(summaries) == 1
     assert "삼성전자" in summaries[0] and "합계 추정손익" in summaries[0]
+
+
+def test_daily_pnl_saved_on_close(tmp_path):
+    from python_app.db.storage import DatabaseManager
+    fake = FakeKiwoom()
+    seed_breakout_day(fake)
+    clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
+    db = DatabaseManager(str(tmp_path / "t.db"))
+    config = StrategyConfig()
+    eng = LiveTradingEngine(make_broker(fake, TradingMode.MOCK, config), config, [("005930", "삼성전자")],
+                            state_dir=str(tmp_path), clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
+                            db=db)
+    eng.start(); eng.tick()
+    clock.set("09:06:20"); eng._last_sync = datetime.min; eng.tick()
+    fake.prices["005930"] = 9898
+    clock.set("09:07:00"); eng.tick()
+    clock.set("09:07:30"); eng._last_sync = datetime.min; eng.tick()
+    rows = db.get_daily_pnl("MOCK")
+    assert len(rows) == 1
+    d = rows[0]
+    assert d["trade_date"] == "20261020" and d["trades"] == 1 and d["losses"] == 1
+    assert d["realized_pnl"] == eng.realized_pnl < 0 and d["cum_pnl"] == d["realized_pnl"]
+    assert d["invested"] > 0
+    assert db.get_daily_pnl("REAL") == []
+
+
+def test_daily_pnl_cumulative(tmp_path):
+    from python_app.db.storage import DatabaseManager
+    db = DatabaseManager(str(tmp_path / "t.db"))
+    db.save_daily_pnl("MOCK", "20261021", -500, 100_000, 1, 0, 1)
+    db.save_daily_pnl("MOCK", "20261020", 2000, 100_000, 2, 2, 0)
+    db.save_daily_pnl("MOCK", "20261020", 3000, 150_000, 3, 3, 0)   # 같은 날 덮어쓰기
+    rows = db.get_daily_pnl("MOCK")
+    assert [r["trade_date"] for r in rows] == ["20261020", "20261021"]
+    assert [r["cum_pnl"] for r in rows] == [3000, 2500]
+
+
+def _db_engine(tmp_path, clock, fake):
+    from python_app.db.storage import DatabaseManager
+    db = DatabaseManager(str(tmp_path / "t.db"))
+    config = StrategyConfig()
+    eng = LiveTradingEngine(make_broker(fake, TradingMode.MOCK, config), config, [("005930", "삼성전자")],
+                            state_dir=str(tmp_path), clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
+                            db=db)
+    return eng, db
+
+
+def _db_rows(db, table):
+    with db._get_connection() as conn:
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+
+
+def test_fills_recorded_in_orders_and_trades(tmp_path):
+    fake = FakeKiwoom()
+    seed_breakout_day(fake)
+    clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
+    eng, db = _db_engine(tmp_path, clock, fake)
+    eng.start(); eng.tick()
+    clock.set("09:06:20"); eng._last_sync = datetime.min; eng.tick()
+
+    orders = _db_rows(db, "orders")
+    assert [o["status"] for o in orders] == ["FILLED"] and orders[0]["filled_qty"] > 0
+    assert orders[0]["filled_price"] > 0 and orders[0]["filled_at"]
+    assert [t["side"] for t in _db_rows(db, "trades")] == ["BUY"]
+
+    fake.prices["005930"] = 9898
+    clock.set("09:07:00"); eng.tick()
+    clock.set("09:07:30"); eng._last_sync = datetime.min; eng.tick()
+
+    orders = {o["side"]: o for o in _db_rows(db, "orders")}
+    assert orders["SELL"]["status"] == "FILLED" and orders["SELL"]["tax"] > 0
+    trades = {t["side"]: t for t in _db_rows(db, "trades")}
+    assert len(_db_rows(db, "trades")) == 2
+    assert trades["SELL"]["realized_pnl"] == eng.realized_pnl < 0
+    assert trades["BUY"]["realized_pnl"] == 0 and trades["BUY"]["tax"] == 0
+    assert trades["BUY"]["executed_at"].endswith("09:06:20")   # 청산 때 다시 기록해도 체결 시각 유지
+
+
+def test_db_failure_does_not_stop_close(tmp_path):
+    fake = FakeKiwoom()
+    seed_breakout_day(fake)
+    clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
+    eng, db = _db_engine(tmp_path, clock, fake)
+    eng.start(); eng.tick()
+
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+    db.save_trade = boom
+    clock.set("09:06:20"); eng._last_sync = datetime.min; eng.tick()
+    assert any(m.status == "HOLDING" for m in eng.managed.values())
+
+
+def test_old_state_file_keeps_buy_order_id(tmp_path):
+    import json
+    fake = FakeKiwoom()
+    clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
+    eng, _ = _db_engine(tmp_path, clock, fake)
+    with open(eng.state_path, "w", encoding="utf-8") as f:
+        json.dump({"trade_date": "20261020", "mode": "MOCK", "realized_pnl": 0.0, "managed": {
+            "005930": {"symbol": "005930", "name": "삼성전자", "status": "BUYING", "order_id": "0001"}}}, f)
+    eng._load_state("20261020")
+    assert eng.managed["005930"].buy_order_id == "0001"
+
+
+def test_unfilled_buy_marked_cancelled(tmp_path):
+    fake = FakeKiwoom()
+    fake.auto_fill = False
+    seed_breakout_day(fake)
+    clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
+    eng, db = _db_engine(tmp_path, clock, fake)
+    eng.start(); eng.tick()
+    clock.set("09:06:40"); eng.tick()
+    assert eng.managed["005930"].status == "FAILED"
+    assert [o["status"] for o in _db_rows(db, "orders")] == ["CANCELLED"]
+    assert _db_rows(db, "trades") == []

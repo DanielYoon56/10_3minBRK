@@ -86,7 +86,22 @@ class DatabaseManager:
                 )
             """)
 
-            # 4. 설정 테이블
+            # 4. 일별 손익 테이블 (모드별 · 거래일별 1행, 엔진이 청산 때마다 갱신)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_pnl (
+                    mode TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    realized_pnl REAL NOT NULL,
+                    invested REAL NOT NULL DEFAULT 0,
+                    trades INTEGER NOT NULL DEFAULT 0,
+                    wins INTEGER NOT NULL DEFAULT 0,
+                    losses INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (mode, trade_date)
+                )
+            """)
+
+            # 5. 설정 테이블
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -124,6 +139,16 @@ class DatabaseManager:
                 order.filled_at.isoformat() if order.filled_at else None
             ))
 
+    def update_order_fill(self, order_id: str, status: str, filled_price: float = 0.0, filled_qty: int = 0,
+                          commission: float = 0.0, tax: float = 0.0, filled_at: Optional[str] = None):
+        """접수된 주문의 체결·취소 결과 반영"""
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE orders SET status = ?, filled_price = ?, filled_qty = ?,
+                                  commission = ?, tax = ?, filled_at = ?
+                WHERE order_id = ?
+            """, (status, filled_price, filled_qty, commission, tax, filled_at, order_id))
+
     def save_trade(self, trade: TradeRecord):
         with self._get_connection() as conn:
             conn.execute("""
@@ -148,3 +173,25 @@ class DatabaseManager:
             cur = conn.cursor()
             cur.execute("SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?", (limit,))
             return [dict(row) for row in cur.fetchall()]
+
+    def save_daily_pnl(self, mode: str, trade_date: str, realized_pnl: float, invested: float,
+                       trades: int, wins: int, losses: int):
+        """거래일 손익 요약 저장 (같은 모드·날짜는 덮어씀)"""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO daily_pnl (
+                    mode, trade_date, realized_pnl, invested, trades, wins, losses, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mode, trade_date, realized_pnl, invested, trades, wins, losses, datetime.now().isoformat()))
+
+    def get_daily_pnl(self, mode: str) -> List[Dict]:
+        """거래일 오름차순 일별 손익 + 누적손익(cum_pnl)"""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM daily_pnl WHERE mode = ? ORDER BY trade_date", (mode,))
+            rows = [dict(row) for row in cur.fetchall()]
+        cum = 0.0
+        for r in rows:
+            cum += r["realized_pnl"]
+            r["cum_pnl"] = cum
+        return rows
