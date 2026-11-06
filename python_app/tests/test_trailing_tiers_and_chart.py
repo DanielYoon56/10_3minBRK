@@ -784,3 +784,49 @@ def test_smc_holding_follows_common_trailing_and_keeps_target(tmp_path):
     assert "트레일링" in _exit_reason(eng, 10200.0)
     eng = _held_engine(tmp_path / "b", stop_price=9800.0, target_price=10600.0, highest_price=10590.0, use_trailing=True)
     assert "목표가" in _exit_reason(eng, 10600.0)
+
+
+# ---------- 실거래 시작 버튼
+
+def _real_start_setup(window, monkeypatch, answer):
+    from unittest.mock import MagicMock
+    from python_app.models.types import TradingMode
+    module = window.main_module
+    window.mode = TradingMode.REAL
+    for ed in window.key_inputs[TradingMode.REAL]:
+        ed.setText("k")
+    asked = []
+    monkeypatch.setattr(module.QMessageBox, "warning", lambda *a, **k: asked.append(a[1]) or answer)
+    worker = MagicMock()
+    for name, stub in (("KiwoomRestBroker", MagicMock()), ("LiveTradingEngine", MagicMock()), ("EngineWorker", worker)):
+        monkeypatch.setattr(module, name, stub)
+    monkeypatch.setattr(window, "_make_screener", lambda broker: None)
+    return asked, worker
+
+
+def test_start_button_asks_and_passes_live_confirmation(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    asked, worker = _real_start_setup(window, monkeypatch, QMessageBox.Yes)
+    window.btn_start.setEnabled(True)
+    window.btn_start.click()
+    assert asked == ["실거래 자동매매 시작"]
+    assert worker.call_args[0][1] is True
+    window.engine = window.worker = None
+
+
+def test_start_button_declined_does_not_start(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    asked, worker = _real_start_setup(window, monkeypatch, QMessageBox.No)
+    window.btn_start.setEnabled(True)
+    window.btn_start.click()
+    assert asked and not worker.called
+
+
+def test_start_button_never_uses_autostart_consent(window, monkeypatch):
+    """사전 동의를 켜 둬도 버튼으로 시작할 때는 확인창을 거친다"""
+    from PySide6.QtWidgets import QMessageBox
+    window.cfg["autostart"]["allow_real_autostart"] = True
+    asked, worker = _real_start_setup(window, monkeypatch, QMessageBox.No)
+    window.btn_start.setEnabled(True)
+    window.btn_start.click()
+    assert asked and not worker.called

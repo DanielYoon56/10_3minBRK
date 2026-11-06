@@ -304,7 +304,7 @@ class MainWindow(QMainWindow):
 
         self.btn_start = QPushButton("자동매매 시작")
         self.btn_start.setObjectName("btn_start")
-        self.btn_start.clicked.connect(self.start_trading)
+        self.btn_start.clicked.connect(lambda: self.start_trading())   # clicked 의 checked=False 가 interactive 로 들어가면 안 됨
         header.addWidget(self.btn_start)
         self.btn_stop = QPushButton("자동매매 중지")
         self.btn_stop.setObjectName("btn_stop")
