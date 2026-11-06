@@ -321,3 +321,12 @@ def test_old_config_migrates_activation_to_1pct(tmp_path):
     cfg["trailing_activation_rate"] = 0.0
     p.write_text(json.dumps(cfg), encoding="utf-8")
     assert load_config(str(p))["trailing_activation_rate"] == 0.0
+
+
+def test_cash_balance_is_smaller_of_orderable_and_deposit():
+    b = make_broker(FakeKiwoom())
+    for body, expected in (({"entr": "000000001000000", "ord_alow_amt": "000000003000000"}, 1_000_000),
+                           ({"entr": "000000003000000", "ord_alow_amt": "000000001000000"}, 1_000_000),
+                           ({"ord_alow_amt": "000000003000000"}, 0)):
+        b._post = lambda *a, body=body, **k: (body, {})
+        assert b.get_cash_balance() == expected

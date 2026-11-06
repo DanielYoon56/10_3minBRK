@@ -13,7 +13,7 @@ Korea3MinBreakoutTrader - 키움증권 REST API 브로커
   kt10000  /api/dostk/ordr      현금 매수
   kt10001  /api/dostk/ordr      현금 매도
   kt10003  /api/dostk/ordr      취소
-  kt00001  /api/dostk/acnt      예수금상세 (ord_alow_amt = 주문가능금액)
+  kt00001  /api/dostk/acnt      예수금상세 (ord_alow_amt = 주문가능금액, entr = 예수금)
   kt00018  /api/dostk/acnt      계좌평가잔고 (보유종목)
   ka10075  /api/dostk/acnt      미체결
   ka10031  /api/dostk/rkinfo    전일거래량·거래대금 상위 100 (매집 스캔 후보)
@@ -405,13 +405,15 @@ class KiwoomRestBroker(BrokerBase):
 
     # ================================================================ 계좌
     def get_cash_balance(self) -> float:
-        """kt00001 예수금상세 → 주문가능금액(ord_alow_amt)"""
+        """kt00001 예수금상세 → 주문가능금액(ord_alow_amt)과 예수금(entr) 중 작은 값.
+        주문가능금액은 미수·증거금 설정에 따라 예수금보다 클 수 있어 예수금을 넘겨 사지 않게 한다.
+        entr 이 없으면 0 = 매수 안 함."""
         try:
             d, _ = self._post(self.ACCOUNT_PATH, "kt00001", {"qry_tp": "3"})
         except (KiwoomApiError, requests.RequestException) as e:
             logger.error("예수금 조회 실패: %s", e)
             return 0.0
-        return _num(d.get("ord_alow_amt"))
+        return min(_num(d.get("ord_alow_amt")), _num(d.get("entr")))
 
     def get_positions(self) -> Dict[str, Position]:
         """kt00018 계좌평가잔고 → 보유종목 (기존 최고가는 유지)"""
