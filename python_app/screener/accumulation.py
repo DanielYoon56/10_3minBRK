@@ -33,6 +33,7 @@ Korea3MinBreakoutTrader - 전일 종가 기준 매집 종목 스캐너
      결과는 다음 거래일 파일(screen_다음평일.json)로 저장 → 다음 날 아침 앱이 그대로 재사용
 """
 
+import glob
 import json
 import logging
 import os
@@ -111,6 +112,23 @@ class ScreenResult:
                    candidates_checked=d.get("candidates_checked", 0), errors=d.get("errors", []))
 
 
+def _read_result(path: str) -> Optional[ScreenResult]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return ScreenResult.from_json(json.load(f))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def latest_cached(state_dir: str) -> Optional[ScreenResult]:
+    """가장 최근 날짜의 저장된 스캔 결과 (20시 스캔은 다음 거래일 파일이므로 오늘보다 뒤일 수 있다)"""
+    for path in sorted(glob.glob(os.path.join(state_dir, "screen_[0-9]*.json")), reverse=True):
+        res = _read_result(path)
+        if res:
+            return res
+    return None
+
+
 def next_weekday(day: datetime) -> str:
     d = day + timedelta(days=1)
     while d.weekday() >= 5:
@@ -160,14 +178,7 @@ class AccumulationScreener:
         return os.path.join(self.state_dir, f"screen_{trade_date}.json")
 
     def load_cached(self, trade_date: str) -> Optional[ScreenResult]:
-        p = self.cache_path(trade_date)
-        if not os.path.exists(p):
-            return None
-        try:
-            with open(p, encoding="utf-8") as f:
-                return ScreenResult.from_json(json.load(f))
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
+        return _read_result(self.cache_path(trade_date))
 
     def _save(self, res: ScreenResult):
         p = self.cache_path(res.trade_date)

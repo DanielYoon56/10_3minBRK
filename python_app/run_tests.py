@@ -87,11 +87,11 @@ class TestExitRules(unittest.TestCase):
         self.assertIsNone(check_exit(p, 9810, cfg))
         self.assertEqual(check_exit(p, 9800, cfg).signal_type, SignalType.SELL_STOP_LOSS)
 
-    def test_trailing_15pct_of_gain(self):
+    def test_trailing_30pct_of_gain_above_1r(self):
         cfg, p = StrategyConfig(), self.pos(10000)
         self.assertIsNone(check_exit(p, 11000, cfg))
-        self.assertIsNone(check_exit(p, 10860, cfg))
-        self.assertEqual(check_exit(p, 10850, cfg).signal_type, SignalType.SELL_TRAILING_STOP)
+        self.assertIsNone(check_exit(p, 10710, cfg))
+        self.assertEqual(check_exit(p, 10700, cfg).signal_type, SignalType.SELL_TRAILING_STOP)
 
 
 class TestPaperBroker(unittest.TestCase):

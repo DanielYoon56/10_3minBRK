@@ -2,12 +2,13 @@
 추가 매수 전략 (B 첫 봉 고가 돌파 / C VWAP 눌림 / D 전일 고가 돌파 / E 당일 전고점 돌파 / F SMC CHoCH→FVG) + AND/OR 조합 테스트
 """
 
+import json
 from datetime import datetime, timedelta
 
 from python_app.engine.live_engine import EngineSettings, LiveTradingEngine
 from python_app.models.types import Bar, OrderType, Position, SignalType, StrategyConfig
 from python_app.strategy.combiner import EntryCombiner
-from python_app.strategy.exit_rules import check_exit, trade_config, trailing_stop_price
+from python_app.strategy.exit_rules import check_exit, trailing_stop_price
 from python_app.strategy.intraday import DaySwingHighBreakout, OrbHighBreakout, PrevHighBreakout, VwapPullback
 from python_app.strategy.smc import SmcChochFvg, floor_to_tick, tick_size
 from python_app.tests.fake_kiwoom import Clock, FakeKiwoom
@@ -112,15 +113,12 @@ def test_smc_choch_then_first_fvg_midpoint_limit():
     assert sig and sig.signal_type == SignalType.BUY_SMC_FVG and sig.order_type == OrderType.LIMIT
     assert sig.price == 9860                          # (9,830 + 9,890) / 2
     assert sig.stop_loss_price == 9740 - 10           # 보호 저점 - 1호가
-    assert sig.take_profit_price == 9860 + 130 * 3    # 3R
-    assert sig.use_trailing is False
     assert sig.expire_at == sig.timestamp + timedelta(minutes=30)
 
 
-def test_smc_4r_and_fvg_stop_mode():
-    sig = feed(SmcChochFvg(StrategyConfig(smc_rr=4.0, smc_stop_mode="fvg")), SMC_ROWS)[-1]
+def test_smc_fvg_stop_mode():
+    sig = feed(SmcChochFvg(StrategyConfig(smc_stop_mode="fvg")), SMC_ROWS)[-1]
     assert sig.stop_loss_price == 9830 - 10           # FVG 하단 - 1호가
-    assert sig.take_profit_price == 9860 + 40 * 4
 
 
 def test_smc_skips_when_risk_out_of_range():
@@ -219,7 +217,7 @@ def test_engine_places_limit_order_and_cancels_on_expiry(tmp_path):
     assert len(buys) == 1
     assert buys[0]["body"]["trde_tp"] == "0" and buys[0]["body"]["ord_uv"] == "9860"
     m = eng.managed[SYM]
-    assert m.status == "BUYING" and m.stop_price == 9730 and m.target_price == 10250
+    assert m.status == "BUYING" and m.stop_price == 9730 and m.target_price == 0
 
     clock.set("10:10:00")                     # 아직 유효 (10:15 까지)
     eng.tick()
@@ -240,8 +238,8 @@ def test_engine_cancels_limit_when_price_breaks_stop_before_fill(tmp_path):
     assert any("셋업 무효" in e for e in events)
 
 
-def test_engine_fill_then_take_profit_at_target(tmp_path):
-    fake, clock, eng, events = _smc_engine(tmp_path)
+def test_engine_smc_follows_common_take_profit_rate(tmp_path):
+    fake, clock, eng, events = _smc_engine(tmp_path, trailing_retrace_rate=0.0, take_profit_rate=4.0)
     no, o = next(iter(fake.unfilled.items()))
     fake.unfilled.pop(no)
     fake.prices[SYM] = 9860
@@ -252,17 +250,36 @@ def test_engine_fill_then_take_profit_at_target(tmp_path):
     assert m.status == "HOLDING" and m.entry_price == 9860
 
     fake.auto_fill = True
-    fake.prices[SYM] = 10100                  # +2.4% — 트레일링이 꺼져 있으므로 유지
+    fake.prices[SYM] = 10100                  # +2.4% — 공통 트레일링을 끄면 유지
     clock.set("09:49:00")
     eng.tick()
     fake.prices[SYM] = 10000
     clock.set("09:49:03")
     eng.tick()
     assert eng.managed[SYM].status == "HOLDING"
-    fake.prices[SYM] = 10250
+    fake.prices[SYM] = 10260                  # 9,860 × 1.04 = 10,254
     clock.set("09:49:06")
     eng.tick()
     assert any("목표가 익절" in e for e in events)
+    assert [o["side"] for o in fake.orders] == ["BUY", "SELL"]
+
+
+def test_engine_smc_holding_sells_on_common_trailing(tmp_path):
+    fake, clock, eng, events = _smc_engine(tmp_path)
+    no, o = next(iter(fake.unfilled.items()))
+    fake.unfilled.pop(no)
+    fake.prices[SYM] = 9860
+    fake._fill(SYM, "BUY", o["qty"])
+    clock.set("09:48:00")
+    eng.tick()
+    fake.auto_fill = True
+    fake.prices[SYM] = 10100
+    clock.set("09:49:00")
+    eng.tick()
+    fake.prices[SYM] = 10000
+    clock.set("09:49:03")
+    eng.tick()
+    assert any("트레일링 스탑" in e for e in events)
     assert [o["side"] for o in fake.orders] == ["BUY", "SELL"]
 
 
@@ -287,14 +304,13 @@ def _dsh(**kw):
     return DaySwingHighBreakout(StrategyConfig(dsh_start_time="09:00", **kw))
 
 
-def test_day_swing_high_signal_has_own_exit_rules():
+def test_day_swing_high_signal_uses_global_stop():
     sigs = feed(_dsh(), DSH_ROWS)
     assert sigs[:-1] == [None] * 5
     sig = sigs[-1]
     assert sig.signal_type == SignalType.BUY_DAY_SWING_HIGH and sig.order_type == OrderType.MARKET
-    assert sig.breakout_level == 10200 and sig.stop_loss_price == round(10280 * 0.995)
-    assert (sig.stop_rate, sig.trail_retrace_rate, sig.trail_activation_rate) == (0.5, 50.0, 0.5)
-    assert "-0.5%" in sig.reason
+    assert sig.breakout_level == 10200 and sig.stop_loss_price == round(10280 * 0.98)
+    assert "-2%" in sig.reason
 
 
 def test_day_swing_high_wick_only_is_not_a_breakout():
@@ -311,16 +327,7 @@ def test_day_swing_high_respects_window():
     assert feed(DaySwingHighBreakout(StrategyConfig()), DSH_ROWS)[-1] is None   # 기본 09:30 시작, 돌파는 09:18
 
 
-def test_trade_config_overrides_trailing_only_when_set():
-    c = StrategyConfig()
-    assert trade_config(c, 0.0, 0.0) is c
-    t = trade_config(c, 50.0, 0.5)
-    assert t.trailing_retrace_rate == 50.0 and t.trailing_activation_rate == 0.5
-    assert trailing_stop_price(10000, 10040, t) is None        # +0.4%: 미발동
-    assert trailing_stop_price(10000, 10100, t) == 10050       # 상승분 100의 50% 되돌림
-
-
-def _dsh_engine(tmp_path):
+def _dsh_engine(tmp_path, **cfg):
     fake = FakeKiwoom()
     fake.names[SYM] = "삼성전자"
     t0 = datetime(2026, 10, 20, 9, 0)
@@ -328,7 +335,7 @@ def _dsh_engine(tmp_path):
         fake.add_bar(SYM, (t0 + timedelta(minutes=3 * i)).strftime("%Y%m%d%H%M%S"), o, h, l, c, v)
     fake.prices[SYM] = 10000
     clock = Clock(datetime(2026, 10, 20, 9, 18, 5))
-    config = StrategyConfig(entry_strategies=["day_swing_high"], dsh_start_time="09:00")
+    config = StrategyConfig(entry_strategies=["day_swing_high"], dsh_start_time="09:00", **cfg)
     eng = LiveTradingEngine(make_broker(fake, config=config), config, [(SYM, "삼성전자")], state_dir=str(tmp_path),
                             clock=clock, settings=EngineSettings(bar_poll_delay_sec=3))
     assert eng.start()
@@ -339,31 +346,55 @@ def _dsh_engine(tmp_path):
     return fake, clock, eng, m
 
 
-def test_engine_stop_uses_fill_price_not_global_rate(tmp_path):
+def test_engine_e_uses_global_stop_rate(tmp_path):
     fake, clock, eng, m = _dsh_engine(tmp_path)
-    assert m.stop_price == 9950                # 체결가 10,000의 -0.5% (전역 -2% 아님)
-    fake.prices[SYM] = 9950
+    assert m.stop_price == 0                   # A~D 와 같이 체결가 기준 전역 -2%
+    fake.prices[SYM] = 9810
+    clock.set("09:18:50"); eng.tick()
+    assert m.status == "HOLDING"
+    fake.prices[SYM] = 9800
     clock.set("09:19:00"); eng.tick()
     assert m.status == "SELLING" and "손절" in m.exit_reason
 
 
-def test_engine_trails_half_of_gain(tmp_path):
-    fake, clock, eng, m = _dsh_engine(tmp_path)
+def test_engine_trails_30pct_above_1r(tmp_path):
+    fake, clock, eng, m = _dsh_engine(tmp_path)    # 손절 -2% → 1R = 200원
     fake.prices[SYM] = 10200
     clock.set("09:19:00"); eng.tick()
-    fake.prices[SYM] = 10110                   # 상승분 200의 45% 되돌림 → 유지
+    fake.prices[SYM] = 10150                   # 상승분 200의 25% 되돌림 → 유지
     clock.set("09:19:10"); eng.tick()
     assert m.status == "HOLDING"
-    fake.prices[SYM] = 10100                   # 50% 되돌림
+    fake.prices[SYM] = 10140                   # 30% 되돌림
     clock.set("09:19:20"); eng.tick()
-    assert m.status == "SELLING" and "트레일링" in m.exit_reason and "50%" in m.exit_reason
+    assert m.status == "SELLING" and "트레일링" in m.exit_reason and "30%" in m.exit_reason
+
+
+def test_engine_e_below_activation_uses_common_rate(tmp_path):
+    fake, clock, eng, m = _dsh_engine(tmp_path, trailing_activation_rate=3.0)
+    fake.prices[SYM] = 10200                   # +2%: 공통 발동(+3%) 전 → 트레일링 없음
+    clock.set("09:19:00"); eng.tick()
+    fake.prices[SYM] = 10060
+    clock.set("09:19:10"); eng.tick()
+    assert m.status == "HOLDING"
+
+
+def test_old_state_file_with_removed_fields_loads(tmp_path):
+    fake, clock, eng, m = _dsh_engine(tmp_path)
+    with open(eng.state_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["managed"][SYM].update(trail_retrace_rate=50.0, trail_activation_rate=0.5)
+    with open(eng.state_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    eng._load_state(data["trade_date"])
+    assert eng.managed[SYM].symbol == SYM and not hasattr(eng.managed[SYM], "trail_retrace_rate")
 
 
 def test_market_partial_fill_updates_avg_price_and_stop(tmp_path):
     fake, clock, eng, m = _dsh_engine(tmp_path)
     fake.holdings[SYM] = {"qty": m.qty + 10, "avg": 10200}
     eng._sync_account()
-    assert m.entry_price == 10200 and m.stop_price == round(10200 * 0.995)
+    assert m.entry_price == 10200 and m.stop_price == 0
+    assert eng.positions[SYM].stop_loss_price == round(10200 * 0.98)      # 전역 %가 새 평균단가를 따른다
 
 
 def test_fill_below_signal_price_is_not_a_gain(tmp_path):
@@ -371,3 +402,54 @@ def test_fill_below_signal_price_is_not_a_gain(tmp_path):
     assert m.highest_price == 10000
     clock.set("09:19:00"); eng.tick()
     assert m.status == "HOLDING"
+
+
+# ============================================================ 같은 날 재진입 — 끝난 거래 보존
+class _DailyDb:
+    def __init__(self):
+        self.saved = None
+
+    def save_daily_pnl(self, mode, date, pnl, invested, trades, wins, losses):
+        self.saved = (pnl, invested, trades, wins, losses)
+
+
+def _reentered(tmp_path):
+    fake, clock, eng, events = _smc_engine(tmp_path, allow_reentry_same_day=True)
+    m = eng.managed[SYM]
+    m.status, m.entry_price, m.qty, m.realized_pnl = "CLOSED", 10000.0, 10, 3000.0
+    eng.realized_pnl = 3000.0
+    sig = eng.signals[-1]
+    eng._try_buy(sig, sig.timestamp)
+    return eng, m
+
+
+def test_reentry_keeps_closed_trade_in_todays_list(tmp_path):
+    eng, first = _reentered(tmp_path)
+    assert eng.closed_today == [first] and eng.managed[SYM].status == "BUYING"
+    assert [t["status"] for t in eng.snapshot()["trades"]] == ["CLOSED", "BUYING"]
+
+
+def test_daily_pnl_counts_both_trades_of_a_reentered_symbol(tmp_path):
+    eng, _ = _reentered(tmp_path)
+    second = eng.managed[SYM]
+    second.status, second.entry_price, second.qty, second.realized_pnl = "CLOSED", 20000.0, 10, -1000.0
+    eng.realized_pnl = 2000.0
+    eng.db = _DailyDb()
+    eng._save_daily_pnl()
+    assert eng.db.saved == (2000.0, 300000.0, 2, 1, 1)
+
+
+def test_closed_today_survives_restart_same_day_only(tmp_path):
+    eng, first = _reentered(tmp_path)
+    again = LiveTradingEngine(eng.broker, eng.config, [(SYM, "삼성전자")], state_dir=str(tmp_path), clock=eng.clock)
+    again._load_state(eng.trade_date)
+    assert [m.realized_pnl for m in again.closed_today] == [3000.0]
+    other = LiveTradingEngine(eng.broker, eng.config, [(SYM, "삼성전자")], state_dir=str(tmp_path), clock=eng.clock)
+    other._load_state("20991231")
+    assert other.closed_today == []
+
+
+def test_new_day_clears_closed_today(tmp_path):
+    eng, _ = _reentered(tmp_path)
+    eng._new_day("20261021")
+    assert eng.closed_today == []

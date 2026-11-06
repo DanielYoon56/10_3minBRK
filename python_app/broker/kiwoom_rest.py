@@ -336,26 +336,51 @@ class KiwoomRestBroker(BrokerBase):
         return {"symbol": symbol, "name": str(d.get("stk_nm", symbol)).strip(),
                 "price": _price(d.get("cur_prc")), "market_cap": mac_won}
 
-    def get_daily_bars(self, symbol: str, base_dt: str) -> List[Dict[str, Any]]:
-        """ka10081 일봉 → 오래된 날짜부터 정렬된 [{dt, open, high, low, close, volume}] (첫 페이지만)"""
-        d, _ = self._post(self.CHART_PATH, "ka10081", {
-            "stk_cd": symbol, "base_dt": base_dt, "upd_stkpc_tp": "1",
-        })
-        bars = []
-        for r in d.get("stk_dt_pole_chart_qry") or []:
-            dt = str(r.get("dt", "")).strip()
-            if len(dt) != 8:
-                continue
-            bars.append({
-                "dt": dt,
-                "open": _price(r.get("open_pric")),
-                "high": _price(r.get("high_pric")),
-                "low": _price(r.get("low_pric")),
-                "close": _price(r.get("cur_prc")),
-                "volume": int(abs(_num(r.get("trde_qty")))),
-            })
-        bars.sort(key=lambda b: b["dt"])
-        return bars
+    def get_daily_bars(self, symbol: str, base_dt: str, pages: int = 1) -> List[Dict[str, Any]]:
+        """ka10081 일봉 → 오래된 날짜부터 정렬된 [{dt, open, high, low, close, volume}] (기본 첫 페이지만)"""
+        bars: Dict[str, Dict[str, Any]] = {}
+        cont = ""
+        for _ in range(pages):
+            d, h = self._post(self.CHART_PATH, "ka10081", {
+                "stk_cd": symbol, "base_dt": base_dt, "upd_stkpc_tp": "1",
+            }, cont_key=cont)
+            for r in d.get("stk_dt_pole_chart_qry") or []:
+                dt = str(r.get("dt", "")).strip()
+                if len(dt) == 8:
+                    bars[dt] = self._chart_row(dt, r)
+            cont = h.get("next-key", "") if h.get("cont-yn") == "Y" else ""
+            if not cont:
+                break
+        return [bars[dt] for dt in sorted(bars)]
+
+    def get_chart_minute_bars(self, symbol: str, tic: int, want: int = 200) -> List[Dict[str, Any]]:
+        """ka10080 분봉 → 차트 표시용 (날짜 구분 없이 최근 want 개 이상, dt = YYYYMMDDHHMMSS, 오래된 순).
+        매매 판단용 get_minute_bars 는 당일 봉만 돌려줘 장 전에는 비므로 별도로 둔다."""
+        bars: Dict[str, Dict[str, Any]] = {}
+        cont = ""
+        for _ in range(4):
+            d, h = self._post(self.CHART_PATH, "ka10080", {
+                "stk_cd": symbol, "tic_scope": str(tic), "upd_stkpc_tp": "1",
+            }, cont_key=cont)
+            for r in d.get("stk_min_pole_chart_qry") or []:
+                dt = str(r.get("cntr_tm", "")).strip()[:14]
+                if len(dt) == 14:
+                    bars[dt] = self._chart_row(dt, r)
+            cont = h.get("next-key", "") if h.get("cont-yn") == "Y" else ""
+            if not cont or len(bars) >= want:
+                break
+        return [bars[dt] for dt in sorted(bars)]
+
+    @staticmethod
+    def _chart_row(dt: str, r: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "dt": dt,
+            "open": _price(r.get("open_pric")),
+            "high": _price(r.get("high_pric")),
+            "low": _price(r.get("low_pric")),
+            "close": _price(r.get("cur_prc")),
+            "volume": int(abs(_num(r.get("trde_qty")))),
+        }
 
     def get_foreign_inst_top(self, date: str, market: str = "000") -> Dict[str, List[Dict[str, Any]]]:
         """ka90009 외국인·기관 매매 상위 (금액 기준, 단위: 천만원) → {"foreign": [...], "inst": [...]} 순매수 순위순"""

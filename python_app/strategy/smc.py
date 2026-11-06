@@ -18,11 +18,10 @@ Korea3MinBreakoutTrader - SMC(Smart Money Concept) 매수 전략: CHoCH → 첫 
   4. 손절가
        swing : 마지막 하락 구조 전환 ~ CHoCH 봉 사이 최저가(보호 저점) - 1호가   (기본)
        fvg   : FVG 하단 - 1호가
-  5. 목표가 = 진입가 + (진입가 - 손절가) × smc_rr   (3R / 4R)
-  6. 손절폭이 진입가의 smc_min_risk_pct% 미만이거나 smc_max_risk_pct% 초과면 진입 안 함
-  7. 신호 시각이 smc_start_time ~ smc_end_time 안일 때만, 종목당 당일 1회
+  5. 손절폭이 진입가의 smc_min_risk_pct% 미만이거나 smc_max_risk_pct% 초과면 진입 안 함
+  6. 신호 시각이 smc_start_time ~ smc_end_time 안일 때만, 종목당 당일 1회
 
-[청산] 엔진이 손절가 / 목표가로 감시 (smc_use_trailing=False 기본: 트레일링 미적용), 장 마감 일괄 청산은 공통.
+[청산] 손절가만 전략 값(위 4번)이고 트레일링·장 마감 일괄 청산 등 나머지는 공통 설정.
 """
 
 import logging
@@ -67,8 +66,6 @@ class SmcChochFvg(BarStrategy):
         self.end_time = parse_hhmm(self.config.smc_end_time)
         if self.config.smc_stop_mode not in ("swing", "fvg"):
             raise ValueError(f"smc_stop_mode는 'swing' 또는 'fvg'여야 합니다: {self.config.smc_stop_mode!r}")
-        if self.config.smc_rr <= 0:
-            raise ValueError("smc_rr은 0보다 커야 합니다")
 
     # ------------------------------------------------------------------ 구조 추적
     def _update_swings(self, st: DayState):
@@ -136,7 +133,6 @@ class SmcChochFvg(BarStrategy):
         if risk <= 0 or risk_pct < c.smc_min_risk_pct or risk_pct > c.smc_max_risk_pct:
             logger.info(f"{tag} → 손절폭 {risk_pct:.2f}% (허용 {c.smc_min_risk_pct:g}~{c.smc_max_risk_pct:g}%) 밖 → 생략")
             return None
-        target = round(entry + risk * c.smc_rr)
         expire = bar.timestamp + timedelta(minutes=3 * max(1, int(c.smc_fvg_expiry_bars)))
         window_end = bar.timestamp.replace(hour=self.end_time.hour, minute=self.end_time.minute, second=0)
         expire = min(expire, max(window_end, bar.timestamp + timedelta(minutes=3)))
@@ -148,9 +144,9 @@ class SmcChochFvg(BarStrategy):
             current_volume=bar.volume, volume_ratio=(bar.volume / first.volume) if first.volume else 0.0,
             reason=(f"[{self.label}] CHoCH(스윙 고점 {ch['level']:,.0f} 돌파) 후 첫 FVG {fvg_low:,.0f}~{fvg_high:,.0f} "
                     f"중간값 {entry:,.0f}원 지정가 | 손절 {stop:,.0f}원({stop_desc}, -{risk_pct:.2f}%) | "
-                    f"목표 {target:,.0f}원({c.smc_rr:g}R) | {expire:%H:%M}까지 미체결 시 취소"),
+                    f"{expire:%H:%M}까지 미체결 시 취소"),
             bar_index=bar.bar_index, breakout_level=ch["level"], stop_loss_price=stop, strategy=self.key,
-            order_type=OrderType.LIMIT, take_profit_price=target, use_trailing=c.smc_use_trailing,
+            order_type=OrderType.LIMIT,
             expire_at=expire,
         )
         st.signal_fired = True

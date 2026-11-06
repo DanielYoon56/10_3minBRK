@@ -11,8 +11,8 @@ GUI와 분리된 순수 로직. 워커 스레드가 tick()을 1초마다 호출�
 
 [매도 흐름]
   앱이 매수한 종목만(관리종목) 2초마다 현재가 조회(ka10001)
-  → exit_rules.check_exit: 손절 -2% / 트레일링(+1% 이상 상승 후 상승분 15% 되돌림)
-     (SMC: 전략 손절가 / 목표가(R배수), 트레일링은 기본 미적용)
+  → exit_rules.check_exit: 손절 -2% / 트레일링(+1% 이상 상승 후 상승분 되돌림: 1R 미만 50%, 1R 이상 30%)
+     (SMC 는 손절가만 전략 값, 나머지는 공통)
   → 시장가 매도(kt10001)
 
 [안전장치]
@@ -36,7 +36,7 @@ from python_app.broker.kiwoom_rest import KiwoomRestBroker
 from python_app.models.types import (OrderSide, OrderStatus, OrderType, Position, Signal, StrategyConfig,
                                      TradeRecord, TradingMode)
 from python_app.strategy.combiner import EntryCombiner
-from python_app.strategy.exit_rules import check_exit, trade_config
+from python_app.strategy.exit_rules import check_exit
 
 logger = logging.getLogger("Korea3MinBreakoutTrader.LiveEngine")
 
@@ -79,16 +79,16 @@ class ManagedTrade:
     strategy: str = ""                # 진입 신호를 낸 전략 키
     order_type: str = "MARKET"        # 매수 주문 방식 (LIMIT = SMC 지정가)
     stop_price: float = 0.0           # 전략 손절가 (0 = 매입가 × (1 - stop_loss_rate%))
-    target_price: float = 0.0         # 전략 목표가 (0 = 없음)
-    use_trailing: bool = True
+    target_price: float = 0.0         # 차트에서 정한 목표가 (0 = 없음)
+    use_trailing: bool = True         # 새 진입은 항상 True. False 는 예전 F 진입분(상태 파일)만 남아 있다
     expire_at: str = ""               # 지정가 매수 유효 시각 (ISO)
     order_qty: int = 0                # 매수 주문 수량
     buy_open: bool = False            # 지정가 매수 잔량이 아직 살아 있음 (부분 체결)
     buy_order_id: str = ""            # 매수 주문번호 (order_id는 매도 주문 시 덮어씀)
     buy_filled_at: str = ""           # 첫 매수 체결 확인 시각 (ISO)
-    stop_rate: float = 0.0            # 전략 손절 % — 체결가로 stop_price 계산 (0 = 사용 안 함)
-    trail_retrace_rate: float = 0.0   # 전략 트레일링 되돌림 % (0 = 전역 설정)
-    trail_activation_rate: float = 0.0
+    stop_rate: float = 0.0            # 손절선을 옮긴 뒤 1R 기준을 체결가로 다시 계산할 % (0 = 사용 안 함)
+    stop_manual: bool = False         # 사용자가 차트에서 옮긴 손절가 (추가 체결로 다시 계산하지 않음)
+    risk_stop: float = 0.0            # 손절선을 옮기기 전 손절가 — 1R 기준으로 계속 쓴다 (0 = stop_price 기준)
 
     def order_dt(self) -> Optional[datetime]:
         try:
@@ -153,6 +153,7 @@ class LiveTradingEngine:
         self.halted_reason = ""
         self.trade_date = ""
         self.managed: Dict[str, ManagedTrade] = {}
+        self.closed_today: List[ManagedTrade] = []   # 같은 날 재진입으로 managed 에서 밀려난 끝난 거래
         self.realized_pnl = 0.0
         self.cash = 0.0
         self.positions: Dict[str, Position] = {}
@@ -199,6 +200,7 @@ class LiveTradingEngine:
             "mode": self.broker.mode.value,
             "realized_pnl": self.realized_pnl,
             "managed": {k: asdict(v) for k, v in self.managed.items()},
+            "closed_today": [asdict(v) for v in self.closed_today],
         }
         tmp = self.state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -215,12 +217,16 @@ class LiveTradingEngine:
         except (OSError, ValueError) as e:
             self._emit("warning", f"상태 파일 읽기 실패 → 새로 시작: {e}")
             return
-        managed = {k: ManagedTrade(**v) for k, v in (data.get("managed") or {}).items()}
+        known = ManagedTrade.__dataclass_fields__    # 예전 상태 파일의 없어진 필드는 무시
+        managed = {k: ManagedTrade(**{f: x for f, x in v.items() if f in known})
+                   for k, v in (data.get("managed") or {}).items()}
         for v in managed.values():   # buy_order_id 없던 시절의 상태 파일
             if not v.buy_order_id and v.status in ("BUYING", "HOLDING"):
                 v.buy_order_id = v.order_id
         if data.get("trade_date") == today:
             self.managed = managed
+            self.closed_today = [ManagedTrade(**{f: x for f, x in v.items() if f in known})
+                                 for v in data.get("closed_today") or []]
             self.realized_pnl = float(data.get("realized_pnl", 0.0))
         else:
             self.managed = {k: v for k, v in managed.items() if v.status in ("HOLDING", "SELLING")}
@@ -310,6 +316,7 @@ class LiveTradingEngine:
         self.trade_date = today
         self.realized_pnl = 0.0
         self.halted_reason = ""
+        self.closed_today = []
         self.managed = {k: v for k, v in self.managed.items() if v.status in ("HOLDING", "SELLING")}
         for v in self.managed.values():
             v.status = "HOLDING"
@@ -414,7 +421,61 @@ class LiveTradingEngine:
     @staticmethod
     def _apply_stop_rate(m: ManagedTrade):
         if m.stop_rate > 0 and m.entry_price > 0:
-            m.stop_price = round(m.entry_price * (1.0 - m.stop_rate / 100.0))
+            stop = round(m.entry_price * (1.0 - m.stop_rate / 100.0))
+            if m.stop_manual:
+                m.risk_stop = stop       # 옮긴 손절가는 두고 1R 기준만 새 평균단가를 따른다
+            else:
+                m.stop_price = stop
+
+    def _manual_refusal(self, symbol: str) -> str:
+        """손절·익절선을 손으로 옮길 수 없는 사유 (빈 문자열 = 가능). 트레일링이 돌면 옮겨도 의미가 없어 막는다"""
+        m, pos = self.managed.get(symbol), self.positions.get(symbol)
+        if not self.running:
+            return "자동매매가 실행 중이 아닙니다."
+        if m is None or pos is None or m.status != "HOLDING":
+            return "보유 중인 앱 관리 종목이 아닙니다."
+        if m.use_trailing and self.config.trailing_retrace_rate > 0:
+            return "트레일링을 쓰는 종목은 손절·익절선을 옮길 수 없습니다."
+        if not (self.last_quotes.get(symbol) or pos.current_price):
+            return "현재가를 확인할 수 없습니다."
+        return ""
+
+    def set_manual_stop(self, symbol: str, price: float) -> str:
+        """차트에서 옮긴 손절가 적용. 성공이면 빈 문자열, 거부면 사유.
+        현재가 이상이면 다음 감시에서 곧바로 매도되므로 받지 않는다."""
+        with self._lock:
+            reason = self._manual_refusal(symbol)
+            if reason:
+                return reason
+            m, pos = self.managed[symbol], self.positions[symbol]
+            current = self.last_quotes.get(symbol) or pos.current_price
+            if not 0 < price < current:
+                return f"손절가는 현재가({current:,.0f}원)보다 낮아야 합니다."
+            before = m.stop_price or pos.stop_loss_price
+            if not m.stop_manual:        # 처음 옮길 때의 손절가가 1R 기준으로 남는다
+                m.risk_stop = before
+                if not m.stop_price:     # 매입가 기준 -N% 종목은 추가 체결 때 1R 기준도 같은 %로 갱신
+                    m.stop_rate = self.config.stop_loss_rate
+            m.stop_price, m.stop_manual = price, True
+            self._save_state()
+        self._emit("info", f"✋ 손절가 수동 변경 {m.name} {before:,.0f}원 → {price:,.0f}원")
+        return ""
+
+    def set_manual_target(self, symbol: str, price: float) -> str:
+        """차트에서 옮긴 익절가 적용. 현재가 이하면 다음 감시에서 곧바로 매도되므로 받지 않는다."""
+        with self._lock:
+            reason = self._manual_refusal(symbol)
+            if reason:
+                return reason
+            m, pos = self.managed[symbol], self.positions[symbol]
+            current = self.last_quotes.get(symbol) or pos.current_price
+            if price <= current:
+                return f"익절가는 현재가({current:,.0f}원)보다 높아야 합니다."
+            before = m.target_price or m.entry_price * (1.0 + self.config.take_profit_rate / 100.0)
+            m.target_price = price
+            self._save_state()
+        self._emit("info", f"✋ 익절가 수동 변경 {m.name} {before:,.0f}원 → {price:,.0f}원")
+        return ""
 
     def _close_trade(self, m: ManagedTrade, manual: bool = False):
         px = m.exit_price or self.last_quotes.get(m.symbol, m.entry_price)
@@ -467,11 +528,15 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error("주문 취소 기록 오류 #%s: %s", order_id, e)
 
+    def _trades_today(self) -> List[ManagedTrade]:
+        """당일 모든 거래 (재진입으로 밀려난 끝난 거래 포함, 오래된 것부터)"""
+        return self.closed_today + list(self.managed.values())
+
     def _save_daily_pnl(self):
         """당일 청산 거래 요약을 DB에 기록 → GUI '일별 누적수익' 탭"""
         if not self.db or not self.trade_date:
             return
-        closed = [m for m in self.managed.values() if m.status == "CLOSED"]
+        closed = [m for m in self._trades_today() if m.status == "CLOSED"]
         try:
             self.db.save_daily_pnl(
                 self.broker.mode.value, self.trade_date, self.realized_pnl,
@@ -574,10 +639,11 @@ class LiveTradingEngine:
                 self._sell(m, pos, price, "전일 이월 종목 시초 청산 (전날 장 마감 청산 누락)", now)
                 continue
 
-            config = trade_config(self.config, m.trail_retrace_rate, m.trail_activation_rate)
-            decision = check_exit(pos, price, config, take_profit_price=m.target_price,
+            decision = check_exit(pos, price, self.config, take_profit_price=m.target_price,
                                   use_trailing=m.use_trailing,
-                                  stop_label="(전략 손절가)" if m.stop_price > 0 else "")
+                                  stop_label=("(수동 손절가)" if m.stop_manual
+                                              else "(전략 손절가)" if m.stop_price > 0 else ""),
+                                  risk_stop=m.risk_stop)
             if pos.highest_price > m.highest_price:
                 m.highest_price = pos.highest_price
                 self._save_state()
@@ -736,15 +802,15 @@ class LiveTradingEngine:
         if not order:
             self._emit("error", f"  └ 매수 주문 실패 ({sig.name}) — 로그 확인")
             return
+        previous = self.managed.get(sym)
+        if previous and previous.status in ("CLOSED", "FAILED"):    # 재진입이 끝난 거래를 덮어쓰지 않게 옮겨 둔다
+            self.closed_today.append(previous)
         self.managed[sym] = ManagedTrade(
             symbol=sym, name=sig.name, status="BUYING", order_id=order.order_id, buy_order_id=order.order_id,
             order_time=now.isoformat(), qty=qty, highest_price=sig.price, signal_price=sig.price,
             strategy=sig.strategy, order_type=sig.order_type.value,
             stop_price=sig.stop_loss_price if is_limit else 0.0,   # 시장가 전략은 기존대로 매입가 기준 -N%
-            target_price=sig.take_profit_price, use_trailing=sig.use_trailing,
             expire_at=sig.expire_at.isoformat() if sig.expire_at else "", order_qty=qty,
-            stop_rate=sig.stop_rate, trail_retrace_rate=sig.trail_retrace_rate,
-            trail_activation_rate=sig.trail_activation_rate,
         )
         if self.db:
             self.db.save_order(order)
@@ -755,7 +821,7 @@ class LiveTradingEngine:
         self._emit("info", f"📈 매수 주문 {sig.name} {qty}주 ({how})\n{sig.reason}", push=True)
 
     def _daily_summary(self):
-        closed = [m for m in self.managed.values() if m.status == "CLOSED"]
+        closed = [m for m in self._trades_today() if m.status == "CLOSED"]
         holding = [m for m in self.managed.values() if m.status in ("HOLDING", "SELLING")]
         lines = [f"📊 당일 마감 요약 [{self.broker.mode_label}] {self.trade_date[:4]}-{self.trade_date[4:6]}-{self.trade_date[6:]}"]
         if closed:
@@ -790,6 +856,7 @@ class LiveTradingEngine:
                 "realized_pnl": self.realized_pnl,
                 "positions": {k: asdict(v) for k, v in self.positions.items()},
                 "managed": {k: asdict(v) for k, v in self.managed.items()},
+                "trades": [asdict(v) for v in self._trades_today()],
                 "quotes": {**self.last_bar_close, **self.last_quotes},
                 "states": states,
             }

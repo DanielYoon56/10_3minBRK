@@ -94,7 +94,7 @@ def test_auto_exit_trailing_stop():
     broker.update_quote(_quote(10000))
     broker.submit_order("005930", "삼성전자", OrderSide.BUY, 10, price=10000)
     broker.update_quote(_quote(11000))                    # 최고가 11,000
-    assert broker.update_quote(_quote(10900)) is None     # 10% 되돌림 → 유지
-    sell = broker.update_quote(_quote(10850))             # 15% 되돌림 → 청산
+    assert broker.update_quote(_quote(10750)) is None     # 25% 되돌림 → 유지
+    sell = broker.update_quote(_quote(10700))             # 1R 이상 구간 30% 되돌림 → 청산
     assert sell is not None and "트레일링" in sell.reason
     assert broker.trades[-1].realized_pnl > 0

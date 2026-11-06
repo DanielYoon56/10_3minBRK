@@ -143,13 +143,13 @@ def test_stop_loss_2pct():
     assert d is not None and d.signal_type == SignalType.SELL_STOP_LOSS
 
 
-def test_trailing_stop_15pct_of_gain():
+def test_trailing_stop_30pct_of_gain_above_1r():
     cfg = StrategyConfig()
     pos = make_position(10_000)
     assert check_exit(pos, 11_000, cfg) is None              # 최고가 11,000, 상승분 1,000
-    assert trailing_stop_price(10_000, pos.highest_price, cfg) == pytest.approx(10_850)
-    assert check_exit(pos, 10_860, cfg) is None              # 14% 되돌림 → 유지
-    d = check_exit(pos, 10_850, cfg)                          # 15% 되돌림 → 청산
+    assert trailing_stop_price(10_000, pos.highest_price, cfg) == pytest.approx(10_700)
+    assert check_exit(pos, 10_710, cfg) is None              # 29% 되돌림 → 유지
+    d = check_exit(pos, 10_700, cfg)                          # 30% 되돌림 → 청산
     assert d is not None and d.signal_type == SignalType.SELL_TRAILING_STOP
 
 
@@ -197,9 +197,9 @@ def test_trailing_activates_exactly_at_1pct():
     cfg = StrategyConfig()
     pos = make_position(10_000)
     check_exit(pos, 10_100, cfg)                         # 최고 +1.0% → 발동
-    assert trailing_stop_price(10_000, pos.highest_price, cfg) == pytest.approx(10_085)
-    assert check_exit(pos, 10_090, cfg) is None
-    d = check_exit(pos, 10_085, cfg)                     # 상승분 100 × 15% = 15 되돌림
+    assert trailing_stop_price(10_000, pos.highest_price, cfg) == pytest.approx(10_050)
+    assert check_exit(pos, 10_060, cfg) is None
+    d = check_exit(pos, 10_050, cfg)                     # 1R 미만: 상승분 100 × 50% = 50 되돌림
     assert d is not None and d.signal_type == SignalType.SELL_TRAILING_STOP
 
 
@@ -215,4 +215,4 @@ def test_activation_zero_restores_immediate_trailing():
     cfg = StrategyConfig(trailing_activation_rate=0.0)
     pos = make_position(10_000)
     check_exit(pos, 10_080, cfg)
-    assert check_exit(pos, 10_060, cfg) is not None      # 0%면 소폭 상승 후에도 즉시 작동
+    assert check_exit(pos, 10_040, cfg) is not None      # 0%면 소폭 상승 후에도 즉시 작동

@@ -127,12 +127,12 @@ def test_full_day_buy_then_trailing_exit(tmp_path):
     fake.prices["005930"] = 11100
     clock.set("09:20:00"); eng.tick()
     assert eng.managed["005930"].highest_price == 11100
-    # 10% 되돌림 → 유지
-    fake.prices["005930"] = 11000
+    # 20% 되돌림 → 유지
+    fake.prices["005930"] = 10900
     clock.set("09:20:03"); eng.tick()
     assert not fake.api_calls("kt10001")
-    # 15% 되돌림 (11,100 - 150 = 10,950) → 매도
-    fake.prices["005930"] = 10950
+    # 1R 이상 구간 30% 되돌림 (11,100 - 300 = 10,800) → 매도
+    fake.prices["005930"] = 10800
     clock.set("09:20:06"); eng.tick()
     sells = fake.api_calls("kt10001")
     assert len(sells) == 1 and sells[0]["body"]["stk_cd"] == "005930"
@@ -229,8 +229,8 @@ def test_state_persists_peak_across_restart(tmp_path):
     eng2, _ = make_engine(fake, clock, tmp_path)
     eng2.start()
     assert eng2.managed["005930"].highest_price == 12000
-    # 재시작 후 12,000 기준 트레일링: 상승분 1,900 × 15% = 285 → 11,715 이하 매도
-    fake.prices["005930"] = 11700
+    # 재시작 후 12,000 기준 트레일링: 상승분 1,900 × 30% = 570 → 11,430 이하 매도
+    fake.prices["005930"] = 11430
     clock.set("09:12:00"); eng2.tick()
     assert fake.api_calls("kt10001")
 
@@ -315,7 +315,7 @@ def test_old_config_migrates_activation_to_1pct(tmp_path):
     p = tmp_path / "config.json"
     p.write_text(json.dumps({"trading_mode": "MOCK", "trailing_activation_rate": 0.0}), encoding="utf-8")
     cfg = load_config(str(p))
-    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 2
+    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 5
     assert strategy_config_from(cfg).trailing_activation_rate == 1.0
     # 이전 후 사용자가 다시 0으로 바꾸면 그대로 유지
     cfg["trailing_activation_rate"] = 0.0

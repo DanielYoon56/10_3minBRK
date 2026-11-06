@@ -6,13 +6,13 @@ Korea3MinBreakoutTrader - 매수 전략 조합 (AND / OR)
   orb_high       B. 첫 3분봉 고가 돌파 (strategy/intraday.py)
   vwap_pullback  C. VWAP 눌림 반등
   prev_high      D. 전일 고가 돌파
-  day_swing_high E. 당일 전고점 돌파 (자체 손절·트레일링)
+  day_swing_high E. 당일 전고점 돌파 (자체 손절)
   smc_fvg        F. SMC CHoCH → 첫 FVG 중간값 지정가 (strategy/smc.py)
 
 조합 (StrategyConfig.entry_logic)
   OR  : 선택한 전략 중 하나라도 신호 → 그 신호로 진입 (같은 봉에 여럿이면 위 우선순위)
   AND : 선택한 전략이 '당일' 모두 한 번 이상 신호를 낸 시점(마지막 신호가 나온 봉)에 진입.
-        진입 방식·손절·목표는 마지막(이번 봉) 신호의 것을 쓴다.
+        진입 방식·손절은 마지막(이번 봉) 신호의 것을 쓴다.
         예) B + F: B 가 09:20 에 나고 F 셋업이 10:40 에 나오면 10:40 에 FVG 중간값 지정가 진입.
         전략마다 진입 시간대가 다르므로 AND 는 신호가 크게 줄어든다.
 

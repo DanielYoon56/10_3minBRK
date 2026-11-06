@@ -13,8 +13,8 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import fields
-from typing import Any, Dict, List, Tuple
+from dataclasses import asdict, fields
+from typing import Any, Dict, List, Optional, Tuple
 
 from python_app.models.types import StrategyConfig, TradingMode
 
@@ -44,6 +44,22 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
         if float(cfg.get("trailing_activation_rate", 0.0) or 0.0) == 0.0:
             cfg["trailing_activation_rate"] = 1.0
         cfg["config_version"] = 2
+    # v3 = 트레일링 되돌림 구간화: 최고가 1R 미만 50% / 1R 이상 30%
+    if int(cfg["config_version"]) < 3:
+        cfg["trailing_retrace_rate"] = 50.0
+        cfg["trailing_retrace_rate_1r"] = 30.0
+        cfg["config_version"] = 3
+    # v4 = 트레일링은 공통 설정만 사용 (E·F 전용 트레일링 항목 삭제)
+    if int(cfg["config_version"]) < 4:
+        for k in ("dsh_trail_retrace_rate", "dsh_trail_activation_rate", "smc_use_trailing"):
+            cfg.pop(k, None)
+        cfg["config_version"] = 4
+    # v5 = 전략별 청산 값 정리: SMC 목표 R 배수·E 전용 손절 삭제 (청산은 SMC 손절가 외에 전부 공통)
+    if int(cfg["config_version"]) < 5:
+        for target in (cfg, *cfg.get("rule_presets", {}).values()):
+            for k in ("smc_rr", "dsh_stop_rate"):
+                target.pop(k, None)
+        cfg["config_version"] = 5
     kw = cfg.setdefault("kiwoom", {})
     for mode in ("mock", "real"):
         kw.setdefault(mode, {"app_key": "", "secret_key": ""})
@@ -59,6 +75,7 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
     for k, v in (("auto_start_trading", True), ("allow_real_autostart", False),
                  ("quit_after_close", True), ("quit_time", "15:40")):
         au.setdefault(k, v)
+    cfg.setdefault("rule_presets", {})
     return cfg
 
 
@@ -76,6 +93,31 @@ def strategy_config_from(cfg: Dict[str, Any]) -> StrategyConfig:
 def update_strategy_fields(cfg: Dict[str, Any], sc: StrategyConfig):
     for k in _STRATEGY_KEYS:
         cfg[k] = getattr(sc, k)
+
+
+def copy_strategy_fields(src: StrategyConfig, dst: StrategyConfig):
+    """dst 를 교체하지 않고 값만 덮어쓴다 — 엔진·브로커가 같은 StrategyConfig 객체를 공유하기 때문"""
+    for k in _STRATEGY_KEYS:
+        setattr(dst, k, getattr(src, k))
+
+
+# 저장된 매매 규칙: cfg["rule_presets"] = {이름: StrategyConfig 값}.
+# 실제로 쓰이는 값은 언제나 cfg 최상위 필드이고, 프리셋은 그 값의 이름 붙인 사본이다.
+def save_rule_preset(cfg: Dict[str, Any], name: str, sc: StrategyConfig):
+    cfg["rule_presets"][name] = asdict(sc)
+
+
+def rule_preset_config(cfg: Dict[str, Any], name: str) -> StrategyConfig:
+    """프리셋 값을 현재 설정 위에 얹는다 (프리셋 저장 뒤 추가된 필드는 현재 값 유지)"""
+    return strategy_config_from({**cfg, **cfg["rule_presets"][name]})
+
+
+def matching_rule_preset(cfg: Dict[str, Any], sc: StrategyConfig) -> Optional[str]:
+    """현재 값과 일치하는 프리셋 이름 (없으면 None)"""
+    for name, preset in cfg["rule_presets"].items():
+        if all(getattr(sc, k) == v for k, v in preset.items() if k in _STRATEGY_KEYS):
+            return name
+    return None
 
 
 def kiwoom_keys(cfg: Dict[str, Any], mode: TradingMode) -> Tuple[str, str]:

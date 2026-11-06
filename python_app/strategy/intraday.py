@@ -24,8 +24,7 @@ Korea3MinBreakoutTrader - 추가 매수 전략 (3분봉, 장중)
    - 전고점 = 가장 최근 확정된 당일 스윙 고점 (좌우 dsh_swing_len 봉보다 고가가 높은 봉, 오른쪽 N봉 완성 후 확정)
    - 종가가 전고점 위로 마감 + 거래량 조건(B와 동일). 돌파된 전고점은 소진 (거래량 미달이어도 다음 스윙을 기다림)
    - 진입 시간대 dsh_start_time ~ dsh_end_time
-   - 청산: 체결가 대비 -dsh_stop_rate% 손절, 최고가 +dsh_trail_activation_rate% 이후 상승분의
-     dsh_trail_retrace_rate% 되돌림 시 트레일링 청산 (전역 손절·트레일링 설정과 별개)
+   - 청산: 손절·트레일링 모두 공통 설정
 
 공통: 시장가 진입, 손절 = 진입가 × (1 - stop_loss_rate%) (E는 위 값), 종목당 당일 1회 신호 (allow_reentry_same_day 제외)
 """
@@ -120,20 +119,16 @@ class BarStrategy:
                     f"({bar.volume:,} <= {threshold:,.0f}) → 진입 보류")
         return False
 
-    @property
-    def stop_rate(self) -> float:
-        return self.config.stop_loss_rate
-
     def _signal(self, st: DayState, bar: Bar, level: float, reason: str, **kw) -> Signal:
         entry = bar.close
-        stop = round(entry * (1.0 - self.stop_rate / 100.0))
+        stop = round(entry * (1.0 - self.config.stop_loss_rate / 100.0))
         first = st.first
         sig = Signal(
             symbol=bar.symbol, name=st.name, signal_type=self.signal_type, price=entry,
             timestamp=bar.timestamp, first_bar_close=first.close, first_bar_volume=first.volume,
             current_volume=bar.volume,
             volume_ratio=(bar.volume / first.volume) if first.volume > 0 else 0.0,
-            reason=f"[{self.label}] {reason} | 손절 {stop:,.0f}원(-{self.stop_rate:g}%)",
+            reason=f"[{self.label}] {reason} | 손절 {stop:,.0f}원(-{self.config.stop_loss_rate:g}%)",
             bar_index=bar.bar_index, breakout_level=level, stop_loss_price=stop, strategy=self.key, **kw,
         )
         st.signal_fired = True
@@ -224,7 +219,7 @@ class PrevHighBreakout(BarStrategy):
 
 
 class DaySwingHighBreakout(BarStrategy):
-    """E. 당일 전고점(스윙 고점) 돌파 — 자체 손절·트레일링"""
+    """E. 당일 전고점(스윙 고점) 돌파 — 자체 손절"""
     key = "day_swing_high"
     label = "E.당일 전고점 돌파"
     signal_type = SignalType.BUY_DAY_SWING_HIGH
@@ -232,10 +227,6 @@ class DaySwingHighBreakout(BarStrategy):
     def _apply_config(self):
         self.start_time = parse_hhmm(self.config.dsh_start_time)
         self.end_time = parse_hhmm(self.config.dsh_end_time)
-
-    @property
-    def stop_rate(self) -> float:
-        return self.config.dsh_stop_rate
 
     def _update_swing(self, st: DayState):
         L = max(1, int(self.config.dsh_swing_len))
@@ -254,7 +245,4 @@ class DaySwingHighBreakout(BarStrategy):
         st.extra["swing_high"] = None
         if not self._can_enter(st, bar) or not self._volume_ok(st, bar, "당일 전고점 돌파"):
             return None
-        c = self.config
-        return self._signal(st, bar, level, f"3분봉 종가 {bar.close:,.0f}원이 당일 전고점 {level:,.0f}원 상향 돌파",
-                            stop_rate=c.dsh_stop_rate, trail_retrace_rate=c.dsh_trail_retrace_rate,
-                            trail_activation_rate=c.dsh_trail_activation_rate)
+        return self._signal(st, bar, level, f"3분봉 종가 {bar.close:,.0f}원이 당일 전고점 {level:,.0f}원 상향 돌파")

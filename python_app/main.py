@@ -2,7 +2,7 @@
 Korea3MinBreakoutTrader - Windows 데스크톱 자동매매 (PySide6 + 키움증권 REST API)
 
 매수: 첫 3분봉 시가 상향 돌파 + 돌파 봉 거래량 > 첫 봉 거래량의 70%
-매도: 손절 -2% / 트레일링 스탑 (+1% 이상 상승 후, 상승분의 15% 되돌림)
+매도: 손절 -2% / 트레일링 스탑 (+1% 이상 상승 후 상승분 되돌림: 최고가 1R 미만 50%, 1R 이상 30%)
 
 [모의거래] 키움 모의투자 서버(mockapi.kiwoom.com) — 모의투자용 앱키
 [실거래]   키움 실서버(api.kiwoom.com)            — 실거래용 앱키, 전환·시작 시 이중 확인
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import logging
 from datetime import datetime, time as dtime
+from typing import List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal as PySignal, QTimer, QTime, QLockFile
 from PySide6.QtGui import QFont, QColor
@@ -31,16 +32,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from python_app.app_config import (
     APP_DIR, load_config, save_config, strategy_config_from, update_strategy_fields,
     kiwoom_keys, watchlist_from, telegram_settings,
+    copy_strategy_fields, matching_rule_preset, rule_preset_config, save_rule_preset,
 )
+from python_app.chart_dialog import BUY_COLOR, PROFIT_COLOR, STOP_COLOR, ChartDialog, PriceLevel
 from python_app.notify.telegram import TelegramNotifier
 from python_app.broker.kiwoom_condition import KiwoomConditionClient
-from python_app.screener.accumulation import AccumulationScreener, ScreenerConfig
+from python_app.screener.accumulation import AccumulationScreener, ScreenerConfig, latest_cached
 from python_app.broker.kiwoom_rest import KiwoomRestBroker
 from python_app.db.storage import DatabaseManager
 from python_app.engine.live_engine import LiveTradingEngine, kst_now
 from python_app.models.types import TradingMode
 from python_app.strategy.combiner import STRATEGY_KEYS, STRATEGY_LABELS
-from python_app.strategy.exit_rules import trade_config, trailing_stop_price
+from python_app.strategy.exit_rules import trailing_stop_price
 
 LOG_DIR = os.path.join(APP_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -248,6 +251,8 @@ class MainWindow(QMainWindow):
         self.db = DatabaseManager(os.path.join(APP_DIR, "korea_breakout_trader.db"))
         self.engine: LiveTradingEngine = None
         self.worker: EngineWorker = None
+        self.chart: ChartDialog = None
+        self._syncing_rules = False
 
         self._init_ui()
         self.setStyleSheet(DARK_THEME_QSS + MODE_QSS)
@@ -336,7 +341,19 @@ class MainWindow(QMainWindow):
         self.table_watch.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_watch.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table_watch.verticalHeader().setVisible(False)
+        self.table_watch.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_watch.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_watch.cellDoubleClicked.connect(self.open_chart)
         wl.addWidget(self.table_watch)
+        row = QHBoxLayout()
+        hint = QLabel("종목을 고르고 [차트 보기]를 누르거나 더블클릭하세요")
+        hint.setStyleSheet("color: #8b949e;")
+        self.btn_chart = QPushButton("차트 보기")
+        self.btn_chart.clicked.connect(self.open_selected_chart)
+        row.addWidget(hint)
+        row.addStretch()
+        row.addWidget(self.btn_chart)
+        wl.addLayout(row)
         self._fill_watch_preview()
         splitter.addWidget(wl_box)
 
@@ -348,6 +365,10 @@ class MainWindow(QMainWindow):
         self.table_pos.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table_pos.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table_pos.verticalHeader().setVisible(False)
+        self.table_pos.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_pos.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_pos.setToolTip("더블클릭하면 매수가·손절가·익절가 선이 그려진 차트가 열립니다")
+        self.table_pos.cellDoubleClicked.connect(self.open_holding_chart)
         tabs.addTab(self.table_pos, "보유 / 관리 종목")
 
         self.table_trades = QTableWidget(0, 7)
@@ -443,6 +464,7 @@ class MainWindow(QMainWindow):
     def _build_strategy_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._build_preset_box())
         box = QGroupBox("매매 규칙 파라미터 (변경 즉시 적용·저장)")
         g = QGridLayout(box)
 
@@ -469,6 +491,7 @@ class MainWindow(QMainWindow):
         self.spn_vol = dspin(0.1, 10.0, 0.1, c.min_volume_ratio, 2)
         self.spn_sl = dspin(0.5, 10.0, 0.1, c.stop_loss_rate)
         self.spn_trail = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate)
+        self.spn_trail_1r = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate_1r)
         self.spn_trail_act = dspin(0.0, 20.0, 0.1, c.trailing_activation_rate)
         self.spn_amount = ispin(100_000, 100_000_000, 100_000, c.order_amount_per_trade)
         self.spn_maxpos = ispin(1, 20, 1, c.max_concurrent_positions)
@@ -484,7 +507,9 @@ class MainWindow(QMainWindow):
         rows = [
             ("신규 진입 시작", self.te_start, "신규 진입 마감", self.te_end),
             ("돌파 봉 최소 거래량 (첫 봉 대비, 0.7 = 70%)", self.spn_vol, "손절 (%)", self.spn_sl),
-            ("트레일링 되돌림 (상승분의 %)", self.spn_trail, "트레일링 발동: 진입 후 최고 상승률 ≥ (%)", self.spn_trail_act),
+            ("트레일링 되돌림: 최고가 1R 미만 (상승분의 %)", self.spn_trail,
+             "트레일링 되돌림: 최고가 1R 이상 (%, 0 = 구분 없음)", self.spn_trail_1r),
+            ("트레일링 발동: 진입 후 최고 상승률 ≥ (%)", self.spn_trail_act, "", None),
             ("1회 매수 금액 (원)", self.spn_amount, "최대 동시 보유 종목", self.spn_maxpos),
             ("일 손실한도 (원, 도달 시 신규 매수 중단)", self.spn_maxloss, "일괄 청산 시각 (15:20 동시호가 전 권장)", self.te_eod),
         ]
@@ -493,7 +518,7 @@ class MainWindow(QMainWindow):
             if w2 is not None:
                 g.addWidget(QLabel(l2), r, 2); g.addWidget(w2, r, 3)
 
-        for wdg in (self.spn_vol, self.spn_sl, self.spn_trail, self.spn_trail_act):
+        for wdg in (self.spn_vol, self.spn_sl, self.spn_trail, self.spn_trail_1r, self.spn_trail_act):
             wdg.valueChanged.connect(self.on_settings_changed)
         for wdg in (self.spn_amount, self.spn_maxpos, self.spn_maxloss):
             wdg.valueChanged.connect(self.on_settings_changed)
@@ -512,14 +537,36 @@ class MainWindow(QMainWindow):
         info = QLabel(
             "★ 감시종목: 키움 조건식 결과 중 전일 매집(① 거래량 급증·양봉·고가 근처 마감  또는  ② 외국인·기관 동시 순매수 상위) 종목\n"
             "★ 매수: 위 '매수 전략'에서 선택한 전략을 OR(하나라도) / AND(당일 모두 충족) 로 조합 — 시장가 진입 (SMC 만 FVG 중간값 지정가)\n"
-            "★ 매도: ① 매입가 대비 손절  ② +1% 이상 오른 뒤 최고가까지 상승분의 N%를 되돌리면 전량 시장가 청산  ③ 장 마감 전 일괄 청산\n"
-            "   (SMC 진입분: 전략 손절가 / 목표가(R 배수)로 청산, 트레일링은 체크 시에만)\n"
+            "★ 매도: ① 매입가 대비 손절  ② 발동 상승률 이상 오른 뒤 상승분을 되돌리면 전량 시장가 청산 (1R = 매입가 - 손절가, 최고가 기준으로 구간 판정)  ③ 장 마감 전 일괄 청산\n"
+            "   (SMC 진입분: 손절가만 전략 값, 나머지는 공통 적용)\n"
             "★ 주의: 감시·매도는 이 앱이 켜져 있을 때만 작동합니다 (PC 절전·종료 시 중단)\n"
             "★ 안전: 앱이 매수한 종목만 청산 · 늦게 시작하면 지나간 신호는 매수 안 함 · 일 손실한도 도달 시 신규 매수 중단")
         info.setStyleSheet("color: #8b949e;")
         lay.addWidget(info)
         lay.addStretch()
         return w
+
+    def _build_preset_box(self) -> QWidget:
+        box = QGroupBox("저장된 매매 규칙 (아래 매매 규칙 파라미터 + 매수 전략을 이름 붙여 보관)")
+        row = QHBoxLayout(box)
+        self.cmb_preset = QComboBox()
+        self.cmb_preset.setMinimumWidth(220)
+        self.btn_preset_apply = QPushButton("적용")
+        self.btn_preset_apply.setObjectName("btn_start")
+        self.btn_preset_apply.clicked.connect(self.apply_preset)
+        btn_save = QPushButton("현재 값 저장")
+        btn_save.clicked.connect(self.save_preset)
+        self.btn_preset_del = QPushButton("삭제")
+        self.btn_preset_del.clicked.connect(self.delete_preset)
+        self.lbl_preset = QLabel()
+        row.addWidget(self.cmb_preset)
+        for wdg in (self.btn_preset_apply, btn_save, self.btn_preset_del):
+            row.addWidget(wdg)
+        row.addSpacing(12)
+        row.addWidget(self.lbl_preset)
+        row.addStretch()
+        self._reload_presets()
+        return box
 
     def _build_entry_box(self, tedit, dspin) -> QWidget:
         c = self.config
@@ -531,8 +578,8 @@ class MainWindow(QMainWindow):
             "orb_high": "첫 3분봉 고가 상향 돌파 + 거래량 (갭상승 종목)",
             "vwap_pullback": "VWAP 위 추세 → VWAP 근처 눌림 후 양봉 반등",
             "prev_high": "전일 일봉 고가 상향 돌파 + 거래량",
-            "day_swing_high": "당일 스윙 고점 상향 돌파 + 거래량, 자체 손절·트레일링",
-            "smc_fvg": "하락 구조 → CHoCH → 첫 FVG 중간값 지정가, 목표 R 배수",
+            "day_swing_high": "당일 스윙 고점 상향 돌파 + 거래량, 자체 손절",
+            "smc_fvg": "하락 구조 → CHoCH → 첫 FVG 중간값 지정가",
         }
         for i, key in enumerate(STRATEGY_KEYS):
             chk = QCheckBox(STRATEGY_LABELS[key])
@@ -551,24 +598,15 @@ class MainWindow(QMainWindow):
         self.te_vwap_end = tedit(c.vwap_end_time)
         self.te_smc_start = tedit(c.smc_start_time)
         self.te_smc_end = tedit(c.smc_end_time)
-        self.spn_rr = dspin(1.0, 10.0, 0.5, c.smc_rr)
         self.cmb_stop_mode = QComboBox()
         self.cmb_stop_mode.addItems(["보호 저점(CHoCH 레그 최저가) 아래", "FVG 하단 아래"])
         self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
-        self.chk_smc_trail = QCheckBox("SMC 진입분도 트레일링 스탑 적용")
-        self.chk_smc_trail.setChecked(c.smc_use_trailing)
         self.te_dsh_start = tedit(c.dsh_start_time)
         self.te_dsh_end = tedit(c.dsh_end_time)
-        self.spn_dsh_stop = dspin(0.1, 10.0, 0.1, c.dsh_stop_rate)
-        self.spn_dsh_trail = dspin(1.0, 90.0, 5.0, c.dsh_trail_retrace_rate)
-        self.spn_dsh_act = dspin(0.0, 20.0, 0.1, c.dsh_trail_activation_rate)
         rows = [
-            ("C. VWAP 진입 마감", self.te_vwap_end, "F. SMC 목표 (R 배수, 3 = 3R)", self.spn_rr),
+            ("C. VWAP 진입 마감", self.te_vwap_end, "F. SMC 손절 기준", self.cmb_stop_mode),
             ("F. SMC 진입 시작", self.te_smc_start, "F. SMC 진입 마감", self.te_smc_end),
-            ("F. SMC 손절 기준", self.cmb_stop_mode, None, self.chk_smc_trail),
             ("E. 진입 시작", self.te_dsh_start, "E. 진입 마감", self.te_dsh_end),
-            ("E. 손절 (-%)", self.spn_dsh_stop, "E. 상승분 되돌림 (%)", self.spn_dsh_trail),
-            ("E. 트레일링 발동 (+%)", self.spn_dsh_act, None, QLabel("")),
         ]
         for r, (l1, w1, l2, w2) in enumerate(rows, start=3):
             g.addWidget(QLabel(l1), r, 0); g.addWidget(w1, r, 1)
@@ -577,12 +615,9 @@ class MainWindow(QMainWindow):
             g.addWidget(w2, r, 3)
         for te in (self.te_vwap_end, self.te_smc_start, self.te_smc_end, self.te_dsh_start, self.te_dsh_end):
             te.timeChanged.connect(self.on_settings_changed)
-        for spn in (self.spn_dsh_stop, self.spn_dsh_trail, self.spn_dsh_act):
-            spn.valueChanged.connect(self.on_settings_changed)
-        self.spn_rr.valueChanged.connect(self.on_settings_changed)
         self.cmb_stop_mode.currentIndexChanged.connect(self.on_settings_changed)
-        self.chk_smc_trail.toggled.connect(self.on_settings_changed)
         note = QLabel("A·B·D 는 위 '신규 진입 시작~마감', C 는 시작~VWAP 마감, E·F 는 자체 시간대를 씁니다. "
+                      "손절·트레일링은 A~F 모두 위 '매매 규칙 파라미터' 값을 씁니다 (F 의 손절가만 전략 기준). "
                       "AND 는 신호가 크게 줄어듭니다. 세부값(눌림 폭·손절폭 범위·지정가 유효 봉 수)은 config.json")
         note.setStyleSheet("color: #8b949e;")
         note.setWordWrap(True)
@@ -762,22 +797,101 @@ class MainWindow(QMainWindow):
         """자동매매 시작 전 감시종목 표시 (스캔 미리보기 또는 고정 종목)"""
         res = getattr(self, "_preview", None)
         sc = self.cfg.get("screener", {})
+        if res is None and sc.get("enabled", True):
+            res = latest_cached(APP_DIR)
         if res is not None:
-            rows = [(h.symbol, h.name, "+".join(h.reasons)) for h in res.hits]
-            title = f"감시 종목 — 미리보기 {len(rows)}종목 (기준일 {res.prev_date})"
+            rows = [(h.symbol, h.name, "+".join(h.reasons), h.detail) for h in res.hits]
+            title = f"감시 종목 — 최근 스캔 {len(rows)}종목 (기준일 {res.prev_date})"
         elif sc.get("enabled", True):
             rows = []
             cond = sc.get("condition_name")
             title = ("감시 종목 — 장 전 자동 선정 예정 " +
                      (f"(조건식 '{cond}' AND 매집)" if cond else "(조건식 미지정 → 전 시장 매집)"))
         else:
-            rows = [(s_, n, "고정") for s_, n in self.watchlist]
+            rows = [(s_, n, "고정", "") for s_, n in self.watchlist]
             title = f"감시 종목 — 고정 {len(rows)}종목"
         self.wl_box.setTitle(title)
         self.table_watch.setRowCount(len(rows))
-        for r, (sym, name, why) in enumerate(rows):
+        for r, (sym, name, why, detail) in enumerate(rows):
             for c, v in enumerate((sym, name, why, "-", "-", "-", "대기")):
                 self.table_watch.setItem(r, c, _item(v))
+            self.table_watch.item(r, 2).setToolTip(detail)
+
+    def open_selected_chart(self, *_):
+        row = self.table_watch.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "차트 보기", "감시 종목 표에서 종목을 먼저 선택하세요.")
+            return
+        self.open_chart(row)
+
+    def open_chart(self, row: int, _col: int = 0):
+        sym_item = self.table_watch.item(row, 0)
+        if sym_item is None:
+            return
+        res = latest_cached(APP_DIR) if self.cfg["screener"].get("enabled", True) else None
+        self._show_chart(sym_item.text(), self.table_watch.item(row, 1).text(),
+                         self.table_watch.item(row, 2).toolTip(), res.prev_date if res else "")
+
+    def open_holding_chart(self, row: int, _col: int = 0):
+        """보유 표 더블클릭. 감시 종목이기도 하면 매집 근거까지 나오도록 감시 표 경로로 연다"""
+        item = self.table_pos.item(row, 0)
+        if item is None:
+            return
+        name, symbol = item.text()[:-1].rsplit("(", 1)      # "종목명(코드)"
+        for found in self.table_watch.findItems(symbol, Qt.MatchExactly):
+            if found.column() == 0:
+                self.open_chart(found.row())
+                return
+        self._show_chart(symbol, name, "", "")
+
+    def _show_chart(self, symbol: str, name: str, detail: str, judge_dt: str):
+        running = self.engine and self.worker and self.worker.isRunning()
+        broker = self.engine.broker if running else self._temp_broker()
+        if not broker:
+            return
+        if self.chart is None:
+            self.chart = ChartDialog(self)
+        self.chart.show_symbol(symbol, name, detail, judge_dt, broker, kst_now().strftime("%Y%m%d"),
+                               levels=lambda: self._price_levels(symbol))
+
+    def _holding_prices(self, p: dict, m: Optional[dict]):
+        """보유 표와 차트 가격선이 같이 쓰는 값: (앱 관리 여부, 매입가, 최고가, 손절가, 트레일링가)"""
+        managed = m is not None and m["status"] in ("BUYING", "HOLDING", "SELLING")
+        entry = (m["entry_price"] if managed and m["entry_price"] else p["avg_price"])
+        peak = max(m["highest_price"] if managed else p["highest_price"], entry)
+        stop = (m["stop_price"] or entry * (1 - self.config.stop_loss_rate / 100)) if managed else 0
+        trail = (trailing_stop_price(entry, peak, self.config, m["risk_stop"] or stop)
+                 if managed and m["use_trailing"] else None)
+        return managed, entry, peak, stop, trail
+
+    def _price_levels(self, symbol: str) -> List[PriceLevel]:
+        """차트 가격선. 앱이 관리하지 않는 기존 보유는 손절·익절을 하지 않으므로 매수가만 긋는다.
+        익절가 = 차트에서 정한 목표가 > 고정 익절 % > 발동한 트레일링가 (check_exit 의 청산 기준과 같은 값)"""
+        if not self.engine:
+            return []
+        snap = self.engine.snapshot()
+        p, m = snap["positions"].get(symbol), snap["managed"].get(symbol)
+        if p is None:
+            return []
+        managed, entry, _, stop, trail = self._holding_prices(p, m)
+        if not entry:
+            return []
+        if not managed:
+            return [PriceLevel("매수", entry, BUY_COLOR)]
+        bought = m["buy_filled_at"] or m["order_time"]
+        since = datetime.fromisoformat(bought).strftime("%Y%m%d%H%M%S") if bought else ""
+        movable = (snap["running"] and m["status"] == "HOLDING"
+                   and not (m["use_trailing"] and self.config.trailing_retrace_rate > 0))
+        move_stop = (lambda price: self.engine.set_manual_stop(symbol, price)) if movable else None
+        move_target = (lambda price: self.engine.set_manual_target(symbol, price)) if movable else None
+        levels = [PriceLevel("매수", entry, BUY_COLOR, since), PriceLevel("손절", stop, STOP_COLOR, since, move_stop)]
+        rate = self.config.take_profit_rate
+        target = m["target_price"] or (entry * (1 + rate / 100) if rate > 0 else 0)
+        if target:
+            levels.append(PriceLevel("익절", target, PROFIT_COLOR, since, move_target))
+        elif trail:
+            levels.append(PriceLevel("익절(트레일링)", trail, PROFIT_COLOR, since))
+        return levels
 
     def _build_api_tab(self) -> QWidget:
         w = QWidget()
@@ -1103,12 +1217,15 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 전략 설정
     def on_settings_changed(self, *_):
+        if self._syncing_rules:
+            return
         c = self.config
         c.trade_start_time = self.te_start.time().toString("HH:mm")
         c.trade_end_time = self.te_end.time().toString("HH:mm")
         c.min_volume_ratio = round(self.spn_vol.value(), 2)
         c.stop_loss_rate = self.spn_sl.value()
         c.trailing_retrace_rate = self.spn_trail.value()
+        c.trailing_retrace_rate_1r = self.spn_trail_1r.value()
         c.trailing_activation_rate = self.spn_trail_act.value()
         c.order_amount_per_trade = self.spn_amount.value()
         c.max_concurrent_positions = self.spn_maxpos.value()
@@ -1122,22 +1239,122 @@ class MainWindow(QMainWindow):
         c.vwap_end_time = self.te_vwap_end.time().toString("HH:mm")
         c.smc_start_time = self.te_smc_start.time().toString("HH:mm")
         c.smc_end_time = self.te_smc_end.time().toString("HH:mm")
-        c.smc_rr = round(self.spn_rr.value(), 2)
         c.smc_stop_mode = "fvg" if self.cmb_stop_mode.currentIndex() == 1 else "swing"
-        c.smc_use_trailing = self.chk_smc_trail.isChecked()
         c.dsh_start_time = self.te_dsh_start.time().toString("HH:mm")
         c.dsh_end_time = self.te_dsh_end.time().toString("HH:mm")
-        c.dsh_stop_rate = round(self.spn_dsh_stop.value(), 2)
-        c.dsh_trail_retrace_rate = round(self.spn_dsh_trail.value(), 2)
-        c.dsh_trail_activation_rate = round(self.spn_dsh_act.value(), 2)
         if not c.entry_strategies:
             self.append_log("warning", "매수 전략이 하나도 선택되지 않았습니다 — 신규 매수 없음")
         if self.engine:
             self.engine.strategy.update_config(c)
         update_strategy_fields(self.cfg, c)
         save_config(self.cfg)
+        self._refresh_preset_status()
+
+    def _set_strategy_widgets(self, c):
+        """on_settings_changed 의 반대 방향: 설정값 → 화면"""
+        for te, hhmm in ((self.te_start, c.trade_start_time), (self.te_end, c.trade_end_time),
+                         (self.te_eod, c.eod_liquidation_time), (self.te_vwap_end, c.vwap_end_time),
+                         (self.te_smc_start, c.smc_start_time), (self.te_smc_end, c.smc_end_time),
+                         (self.te_dsh_start, c.dsh_start_time), (self.te_dsh_end, c.dsh_end_time)):
+            te.setTime(QTime.fromString(hhmm, "HH:mm"))
+        for spn, val in ((self.spn_vol, c.min_volume_ratio), (self.spn_sl, c.stop_loss_rate),
+                         (self.spn_trail, c.trailing_retrace_rate), (self.spn_trail_1r, c.trailing_retrace_rate_1r),
+                         (self.spn_trail_act, c.trailing_activation_rate),
+                         (self.spn_amount, c.order_amount_per_trade), (self.spn_maxpos, c.max_concurrent_positions),
+                         (self.spn_maxloss, c.max_daily_loss)):
+            spn.setValue(val)
+        for chk, on in ((self.chk_eod, c.eod_liquidation), (self.chk_carry, c.carryover_sell_at_open),
+                        (self.chk_no_reentry, not c.allow_reentry_same_day)):
+            chk.setChecked(on)
+        for key, chk in self.chk_strats.items():
+            chk.setChecked(key in c.entry_strategies)
+        self.cmb_logic.setCurrentIndex(1 if str(c.entry_logic).upper() == "AND" else 0)
+        self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
+
+    # ================================================================ 저장된 매매 규칙
+    def _reload_presets(self, select: str = ""):
+        self.cmb_preset.clear()
+        self.cmb_preset.addItems(list(self.cfg["rule_presets"]))
+        self.cmb_preset.setCurrentText(select or matching_rule_preset(self.cfg, self.config) or "")
+        self._refresh_preset_status()
+
+    def _refresh_preset_status(self):
+        active = matching_rule_preset(self.cfg, self.config)
+        self.lbl_preset.setText(f"현재 값 = '{active}'" if active else "현재 값: 저장 안 됨")
+        self.lbl_preset.setStyleSheet(f"color: {'#3fb950' if active else '#d29922'};")
+        has_presets = self.cmb_preset.count() > 0
+        self.btn_preset_apply.setEnabled(has_presets)
+        self.btn_preset_del.setEnabled(has_presets)
+
+    def apply_preset(self):
+        name = self.cmb_preset.currentText()
+        if name not in self.cfg["rule_presets"]:
+            return
+        target = rule_preset_config(self.cfg, name)
+        running = bool(self.worker and self.worker.isRunning())
+        warnings = []
+        if matching_rule_preset(self.cfg, self.config) is None:
+            warnings.append("지금 화면의 값은 저장되어 있지 않아 사라집니다.")
+        if running and set(target.entry_strategies) - set(self.config.entry_strategies):
+            warnings.append("가동 중에 새로 켜는 매수 전략은 지금부터 받는 봉만 봅니다. "
+                            "첫 봉 기준 전략은 기준이 달라지므로 장 시작 전 적용을 권장합니다.")
+        if running and self.mode == TradingMode.REAL:
+            warnings.append("실계좌 자동매매가 가동 중이며 아래 규칙이 즉시 적용됩니다.\n\n" + self._rule_summary(target))
+        if warnings:
+            ans = QMessageBox.warning(self, "매매 규칙 적용", f"'{name}' 을(를) 적용할까요?\n\n" + "\n\n".join(warnings),
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+        self._syncing_rules = True      # 위젯마다 설정이 반쯤 바뀐 채 엔진에 전달되지 않도록 한 번에 반영
+        try:
+            self._set_strategy_widgets(target)
+        finally:
+            self._syncing_rules = False
+        copy_strategy_fields(target, self.config)   # 화면에 없는 세부값(config.json 전용)까지 복사
+        self.on_settings_changed()
+        self.append_log("info", f"매매 규칙 '{name}' 적용")
+
+    def save_preset(self):
+        name, ok = QInputDialog.getText(self, "매매 규칙 저장", "저장할 이름 (같은 이름이면 덮어씁니다):",
+                                        text=self.cmb_preset.currentText())
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self.cfg["rule_presets"]:
+            ans = QMessageBox.question(self, "매매 규칙 저장", f"'{name}' 을(를) 현재 값으로 덮어쓸까요?")
+            if ans != QMessageBox.Yes:
+                return
+        self.on_settings_changed()      # 화면에 보이는 값 그대로 저장
+        save_rule_preset(self.cfg, name, self.config)
+        save_config(self.cfg)
+        self._reload_presets(select=name)
+        self.append_log("info", f"매매 규칙 '{name}' 저장")
+
+    def delete_preset(self):
+        name = self.cmb_preset.currentText()
+        if name not in self.cfg["rule_presets"]:
+            return
+        if QMessageBox.question(self, "매매 규칙 삭제", f"'{name}' 을(를) 삭제할까요?") != QMessageBox.Yes:
+            return
+        del self.cfg["rule_presets"][name]
+        save_config(self.cfg)
+        self._reload_presets()
+        self.append_log("info", f"매매 규칙 '{name}' 삭제")
 
     # ================================================================ 시작/중지
+    def _rule_summary(self, c) -> str:
+        strategies = f" {str(c.entry_logic).upper()} ".join(
+            STRATEGY_LABELS[k] for k in STRATEGY_KEYS if k in c.entry_strategies)
+        return (
+            f"· 매수 전략: {strategies or '없음'}\n"
+            f"· 1회 매수 금액: {c.order_amount_per_trade:,}원\n"
+            f"· 최대 동시 보유: {c.max_concurrent_positions}종목\n"
+            f"· 일 손실한도: {c.max_daily_loss:,}원\n"
+            f"· 당일 재진입: {'금지' if not c.allow_reentry_same_day else '허용'}\n"
+            f"· 손절 -{c.stop_loss_rate:g}% / 트레일링: +{c.trailing_activation_rate:g}% 이상 상승 후 "
+            f"상승분 되돌림 1R 미만 {c.trailing_retrace_rate:g}% / 1R 이상 {c.trailing_retrace_rate_1r:g}%\n"
+            f"· 장 마감 일괄 청산: {c.eod_liquidation_time if c.eod_liquidation else '사용 안 함'}")
+
     def start_trading(self, interactive: bool = True):
         self._keys_from_inputs()
         app_key, secret = kiwoom_keys(self.cfg, self.mode)
@@ -1156,16 +1373,10 @@ class MainWindow(QMainWindow):
         if self.mode == TradingMode.REAL and not interactive:
             live_confirmed = bool(self.cfg["autostart"].get("allow_real_autostart"))   # 설정 시 사전 동의
         elif self.mode == TradingMode.REAL:
-            c = self.config
             ans = QMessageBox.warning(
                 self, "실거래 자동매매 시작",
                 "실제 계좌로 자동 주문을 시작합니다.\n\n"
-                f"· 1회 매수 금액: {c.order_amount_per_trade:,}원\n"
-                f"· 최대 동시 보유: {c.max_concurrent_positions}종목\n"
-                f"· 일 손실한도: {c.max_daily_loss:,}원\n"
-                f"· 당일 재진입: {'금지' if not c.allow_reentry_same_day else '허용'}\n"
-                f"· 손절 -{c.stop_loss_rate:g}% / 트레일링: +{c.trailing_activation_rate:g}% 이상 상승 후 상승분 {c.trailing_retrace_rate:g}% 되돌림\n"
-                f"· 장 마감 일괄 청산: {c.eod_liquidation_time if c.eod_liquidation else '사용 안 함'}\n\n"
+                f"{self._rule_summary(self.config)}\n\n"
                 "※ 감시·매도는 이 앱이 켜져 있는 동안만 작동합니다. PC 절전을 꺼 두세요.\n\n"
                 "시작할까요?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -1301,14 +1512,8 @@ class MainWindow(QMainWindow):
         rows = []
         for sym, p in snap["positions"].items():
             m = snap["managed"].get(sym)
-            managed = m is not None and m["status"] in ("BUYING", "HOLDING", "SELLING")
-            entry = (m["entry_price"] if managed and m["entry_price"] else p["avg_price"])
+            managed, entry, peak, stop, trail = self._holding_prices(p, m)
             cur = quotes.get(sym, p["current_price"])
-            peak = max(m["highest_price"] if managed else p["highest_price"], entry)
-            trail = (trailing_stop_price(entry, peak, trade_config(self.config, m["trail_retrace_rate"],
-                                                                   m["trail_activation_rate"]))
-                     if managed and m["use_trailing"] else None)
-            stop = (m["stop_price"] or entry * (1 - self.config.stop_loss_rate / 100)) if managed else 0
             if managed and not m["use_trailing"]:
                 trail_txt = f"목표 {m['target_price']:,.0f}" if m["target_price"] else "미적용"
             else:
@@ -1328,7 +1533,7 @@ class MainWindow(QMainWindow):
             for c, v in enumerate(row):
                 self.table_pos.setItem(r, c, _item(v))
 
-        trades = list(snap["managed"].values())
+        trades = snap["trades"]
         self.table_trades.setRowCount(len(trades))
         status_kr = {"BUYING": "매수 주문중", "HOLDING": "보유", "SELLING": "매도 주문중",
                      "CLOSED": "청산 완료", "FAILED": "미체결 취소"}
