@@ -315,7 +315,7 @@ def test_old_config_migrates_activation_to_1pct(tmp_path):
     p = tmp_path / "config.json"
     p.write_text(json.dumps({"trading_mode": "MOCK", "trailing_activation_rate": 0.0}), encoding="utf-8")
     cfg = load_config(str(p))
-    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 5
+    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 6
     assert strategy_config_from(cfg).trailing_activation_rate == 1.0
     # 이전 후 사용자가 다시 0으로 바꾸면 그대로 유지
     cfg["trailing_activation_rate"] = 0.0

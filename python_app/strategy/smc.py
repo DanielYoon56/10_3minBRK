@@ -19,7 +19,7 @@ Korea3MinBreakoutTrader - SMC(Smart Money Concept) 매수 전략: CHoCH → 첫 
        swing : 마지막 하락 구조 전환 ~ CHoCH 봉 사이 최저가(보호 저점) - 1호가   (기본)
        fvg   : FVG 하단 - 1호가
   5. 손절폭이 진입가의 smc_min_risk_pct% 미만이거나 smc_max_risk_pct% 초과면 진입 안 함
-  6. 신호 시각이 smc_start_time ~ smc_end_time 안일 때만, 종목당 당일 1회
+  6. 신호 시각이 trade_start_time ~ 14:00(마감 고정) 안일 때만, 종목당 당일 1회
 
 [청산] 손절가만 전략 값(위 4번)이고 트레일링·장 마감 일괄 청산 등 나머지는 공통 설정.
 """
@@ -29,7 +29,7 @@ from datetime import timedelta
 from typing import Optional, Tuple
 
 from python_app.models.types import Bar, OrderType, Signal, SignalType, StrategyConfig
-from python_app.strategy.intraday import BarStrategy, DayState, parse_hhmm
+from python_app.strategy.intraday import LATE_ENTRY_END_TIME, BarStrategy, DayState, parse_hhmm
 
 logger = logging.getLogger("Korea3MinBreakoutTrader.Strategy")
 
@@ -62,8 +62,8 @@ class SmcChochFvg(BarStrategy):
     signal_type = SignalType.BUY_SMC_FVG
 
     def _apply_config(self):
-        self.start_time = parse_hhmm(self.config.smc_start_time)
-        self.end_time = parse_hhmm(self.config.smc_end_time)
+        super()._apply_config()      # 진입 시작 = 공통 trade_start_time
+        self.end_time = parse_hhmm(LATE_ENTRY_END_TIME)   # 마감 14:00 고정
         if self.config.smc_stop_mode not in ("swing", "fvg"):
             raise ValueError(f"smc_stop_mode는 'swing' 또는 'fvg'여야 합니다: {self.config.smc_stop_mode!r}")
 

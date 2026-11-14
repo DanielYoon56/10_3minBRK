@@ -88,7 +88,7 @@ def test_v3_config_drops_per_strategy_trailing_keys(tmp_path):
     path.write_text(json.dumps({"config_version": 3, "dsh_stop_rate": 2.0, "dsh_trail_retrace_rate": 50.0,
                                 "dsh_trail_activation_rate": 1.0, "smc_use_trailing": True}), encoding="utf-8")
     cfg = load_config(str(path))
-    assert cfg["config_version"] == 5
+    assert cfg["config_version"] == 6
     assert not {"dsh_trail_retrace_rate", "dsh_trail_activation_rate", "smc_use_trailing"} & set(cfg)
     strategy_config_from(cfg)
 
@@ -719,7 +719,7 @@ def test_v4_config_drops_per_strategy_exit_keys(tmp_path):
                                 "rule_presets": {"ST1": {"dsh_stop_rate": 2.0, "smc_rr": 4.0, "stop_loss_rate": 2.0}}}),
                     encoding="utf-8")
     cfg = load_config(str(path))
-    assert cfg["config_version"] == 5 and cfg["stop_loss_rate"] == 1.5
+    assert cfg["config_version"] == 6 and cfg["stop_loss_rate"] == 1.5
     assert not {"dsh_stop_rate", "smc_rr"} & set(cfg)
     assert cfg["rule_presets"]["ST1"] == {"stop_loss_rate": 2.0}
     strategy_config_from(cfg)

@@ -243,3 +243,44 @@ def test_overwrite_declined_and_delete(window, monkeypatch):
     window.delete_preset()
     assert load_config(window.saved_path)["rule_presets"] == {}
     assert not window.btn_preset_apply.isEnabled()
+
+
+def test_condition_list_load_gives_visible_feedback(window, monkeypatch):
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def list_conditions(self):
+            return [("0", "기존조건"), ("1", "새조건")]
+
+    monkeypatch.setattr(window.main_module, "KiwoomConditionClient", FakeClient)
+    monkeypatch.setattr(window, "_temp_broker", lambda: object())
+    window.cmb_cond.setCurrentText("기존조건")
+    window.show()
+    window.load_condition_list()
+    popup_shown = window.cmb_cond.view().isVisible()
+    window.cmb_cond.hidePopup()
+
+    assert popup_shown
+    assert window.cmb_cond.currentText() == "기존조건"
+    assert window.cmb_cond.count() == 2
+    assert "2개" in window.statusBar.currentMessage()
+
+
+def test_scan_progress_shows_count_and_time_left(window):
+    window._scan_started = window.main_module.time.monotonic() - 100
+    window.on_scan_progress(100, 400)
+    assert window.btn_scan.text() == "스캔 중… 100/400 (약 5분 남음)"
+    window.on_scan_progress(0, 400)
+    assert window.btn_scan.text() == "스캔 중… 0/400"
+
+
+def test_scan_warning_reaches_log_tab(window):
+    window._make_screener(object()).log("warning", "조건식 결과 682종목 → 상위 400개만 검사")
+    assert "상위 400개만 검사" in window.txt_log.toPlainText()

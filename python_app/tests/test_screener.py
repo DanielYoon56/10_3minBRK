@@ -163,6 +163,17 @@ def test_cache_reused_same_day(tmp_path):
     assert len(fake.api_calls("ka10081")) == n and len(res.hits) == 2
 
 
+def test_progress_reports_each_candidate(tmp_path):
+    fake = FakeKiwoom()
+    build_market(fake)
+    screener = AccumulationScreener(make_broker(fake), ScreenerConfig(), state_dir=str(tmp_path))
+    seen = []
+    screener.progress = lambda done, total: seen.append((done, total))
+    screener.run(TODAY, use_cache=False)
+    total = seen[0][1]
+    assert total > 1 and seen == [(i, total) for i in range(total)]
+
+
 def test_name_exclusion_helper():
     for n in ("KODEX 200", "TIGER 미국S&P500", "엔에이치스팩29호", "현대차2우B", "삼성전자우", "신한 인버스 ETN"):
         assert is_excluded_name(n), n

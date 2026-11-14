@@ -173,6 +173,7 @@ class AccumulationScreener:
         self.condition_client_factory = condition_client_factory   # () -> KiwoomConditionClient (with 문 지원)
         self.state_dir = state_dir
         self.log = log or (lambda lv, m: getattr(logger, lv, logger.info)(m))
+        self.progress: Optional[Callable[[int, int], None]] = None   # (검사 완료 수, 전체) — 일봉 판정 진행률
 
     def cache_path(self, trade_date: str) -> str:
         return os.path.join(self.state_dir, f"screen_{trade_date}.json")
@@ -251,7 +252,9 @@ class AccumulationScreener:
         prev_date = ""
         hit_dates: Dict[str, str] = {}
         # --- ① 일봉 판정
-        for c in uniq:
+        for i, c in enumerate(uniq):
+            if self.progress:
+                self.progress(i, len(uniq))
             try:
                 bars = self.broker.get_daily_bars(c["symbol"], today)
             except Exception as e:

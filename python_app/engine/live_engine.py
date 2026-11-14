@@ -351,12 +351,16 @@ class LiveTradingEngine:
     def _start_screen_thread(self, now: datetime, use_cache: bool):
         self.screen_status = "매집 스캔 중…"
         self._emit("info", "🔍 전일 매집 종목 스캔 시작 (코스피·코스닥 전체)")
-        # 백그라운드 실행 → 스캔(최대 1분) 동안에도 손절·트레일링 감시는 계속
+        # 백그라운드 실행 → 스캔 동안에도 손절·트레일링 감시는 계속 (후보 1종목당 약 0.7초)
         self._screen_thread = threading.Thread(target=self._run_screen, args=(now, use_cache),
                                                name="screener", daemon=True)
         self._screen_thread.start()
 
     def _run_screen(self, now: datetime, use_cache: bool):
+        def progress(done: int, total: int):
+            self.screen_status = f"매집 스캔 중… {done}/{total}"
+
+        self.screener.progress = progress
         try:
             res = self.screener.run(now, use_cache=use_cache)
         except Exception as e:
@@ -718,22 +722,33 @@ class LiveTradingEngine:
             return
         self._last_bar_poll_idx = idx
 
-        for sym, name in self.watchlist:
-            try:
-                bars = self.broker.get_minute_bars(sym, self.trade_date, now, tic=3)
-            except Exception as e:
-                self._emit("warning", f"[{name}] 3분봉 조회 실패: {e}")
-                continue
-            if bars:
-                self.last_bar_close[sym] = bars[-1].close
-            last = self._last_fed.get(sym)
-            for bar in bars:
-                if not bar.is_completed or (last and bar.timestamp <= last):
+        pending: List[Signal] = []
+        try:
+            for sym, name in self.watchlist:
+                try:
+                    bars = self.broker.get_minute_bars(sym, self.trade_date, now, tic=3)
+                except Exception as e:
+                    self._emit("warning", f"[{name}] 3분봉 조회 실패: {e}")
                     continue
-                self._last_fed[sym] = bar.timestamp
-                sig = self.strategy.process_bar(bar, name)
-                if sig:
-                    self._on_signal(sig, now)
+                if bars:
+                    self.last_bar_close[sym] = bars[-1].close
+                last = self._last_fed.get(sym)
+                for bar in bars:
+                    if not bar.is_completed or (last and bar.timestamp <= last):
+                        continue
+                    self._last_fed[sym] = bar.timestamp
+                    sig = self.strategy.process_bar(bar, name)
+                    if sig:
+                        pending.append(sig)
+        finally:
+            # 전 종목 신호를 모은 뒤 충족 조건이 많은 순으로 매수 (같으면 감시종목 순서 유지)
+            for sig in sorted(pending, key=self._matched_conditions, reverse=True):
+                self._on_signal(sig, now)
+
+    def _matched_conditions(self, sig: Signal) -> int:
+        """충족한 OR 조건 수 = 매수 전략 수 + 매집 조건(① 거래량·캔들, ② 수급) 수"""
+        reasons = self.screen_info.get(sig.symbol, {}).get("reasons", [])
+        return sig.matched_strategies + ("①" in reasons) + any(r.startswith("②") for r in reasons)
 
     def _on_signal(self, sig: Signal, now: datetime):
         self.signals.append(sig)
@@ -746,7 +761,8 @@ class LiveTradingEngine:
         if age > self.settings.stale_signal_sec:
             self._emit("info", f"○ 과거 신호 기록만 함 (진입 안 함): {sig.name} {sig.timestamp:%H:%M} — {sig.reason}")
             return
-        self._emit("info", f"★ 매수 신호 {sig.name} {sig.timestamp:%H:%M} — {sig.reason}")
+        self._emit("info", f"★ 매수 신호 [조건 {self._matched_conditions(sig)}개] {sig.name} "
+                           f"{sig.timestamp:%H:%M} — {sig.reason}")
         self._try_buy(sig, now)
 
     def _active_count(self) -> int:

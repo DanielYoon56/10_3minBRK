@@ -60,7 +60,13 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
             for k in ("smc_rr", "dsh_stop_rate"):
                 target.pop(k, None)
         cfg["config_version"] = 5
-    kw = cfg.setdefault("kiwoom", {})
+    # v6 = 매수 전략별 진입 시간대 삭제 (모든 전략이 공통 trade_start_time~trade_end_time 사용)
+    if int(cfg["config_version"]) < 6:
+        for target in (cfg, *cfg.get("rule_presets", {}).values()):
+            for k in ("vwap_end_time", "dsh_start_time", "dsh_end_time", "smc_start_time", "smc_end_time"):
+                target.pop(k, None)
+        cfg["config_version"] = 6
+    kw =cfg.setdefault("kiwoom", {})
     for mode in ("mock", "real"):
         kw.setdefault(mode, {"app_key": "", "secret_key": ""})
     tg = cfg.setdefault("telegram", {})

@@ -12,6 +12,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 import logging
 from datetime import datetime, time as dtime
 from typing import List, Optional
@@ -40,7 +41,7 @@ from python_app.broker.kiwoom_condition import KiwoomConditionClient
 from python_app.screener.accumulation import AccumulationScreener, ScreenerConfig, latest_cached
 from python_app.broker.kiwoom_rest import KiwoomRestBroker
 from python_app.db.storage import DatabaseManager
-from python_app.engine.live_engine import LiveTradingEngine, kst_now
+from python_app.engine.live_engine import FEE_RATE, TAX_RATE, LiveTradingEngine, kst_now
 from python_app.models.types import TradingMode
 from python_app.strategy.combiner import STRATEGY_KEYS, STRATEGY_LABELS
 from python_app.strategy.exit_rules import trailing_stop_price
@@ -206,10 +207,12 @@ class EngineWorker(QThread):
 class ScanWorker(QThread):
     """자동매매 시작 전 [지금 스캔] 미리보기용"""
     done = PySignal(object, str)   # ScreenResult or None, error
+    progress = PySignal(int, int)  # 검사 완료 수, 전체
 
     def __init__(self, screener, now):
         super().__init__()
         self.screener, self.now = screener, now
+        screener.progress = self.progress.emit
 
     def run(self):
         try:
@@ -235,8 +238,11 @@ def _item(text, align=Qt.AlignCenter, color: str = ""):
 
 
 class MainWindow(QMainWindow):
+    scan_log = PySignal(str, str)   # level, message — 스캔 스레드에서도 실행 로그 탭에 안전하게 표시
+
     def __init__(self, autostart: bool = False):
         super().__init__()
+        self.scan_log.connect(self.append_log)
         self.setWindowTitle("Korea3MinBreakoutTrader — 3분봉 시가돌파 자동매매 [키움증권]")
         self.autostart = autostart
         self._force_close = False
@@ -371,8 +377,8 @@ class MainWindow(QMainWindow):
         self.table_pos.cellDoubleClicked.connect(self.open_holding_chart)
         tabs.addTab(self.table_pos, "보유 / 관리 종목")
 
-        self.table_trades = QTableWidget(0, 7)
-        self.table_trades.setHorizontalHeaderLabels(["종목", "주문번호", "상태", "수량", "진입가", "청산 사유", "추정손익"])
+        self.table_trades = QTableWidget(0, 8)
+        self.table_trades.setHorizontalHeaderLabels(["종목", "주문번호", "상태", "수량", "진입가", "수익률(비용 차감)", "청산 사유", "추정손익"])
         self.table_trades.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_trades.verticalHeader().setVisible(False)
         tabs.addTab(self.table_trades, "당일 매매")
@@ -493,6 +499,7 @@ class MainWindow(QMainWindow):
         self.spn_trail = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate)
         self.spn_trail_1r = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate_1r)
         self.spn_trail_act = dspin(0.0, 20.0, 0.1, c.trailing_activation_rate)
+        self.spn_trail_act.setToolTip("진입 후 최고가가 이 % 이상 오른 뒤부터 트레일링 스탑 적용 (0 = 즉시 적용)")
         self.spn_amount = ispin(100_000, 100_000_000, 100_000, c.order_amount_per_trade)
         self.spn_maxpos = ispin(1, 20, 1, c.max_concurrent_positions)
         self.spn_maxloss = ispin(10_000, 100_000_000, 50_000, c.max_daily_loss)
@@ -509,7 +516,7 @@ class MainWindow(QMainWindow):
             ("돌파 봉 최소 거래량 (첫 봉 대비, 0.7 = 70%)", self.spn_vol, "손절 (%)", self.spn_sl),
             ("트레일링 되돌림: 최고가 1R 미만 (상승분의 %)", self.spn_trail,
              "트레일링 되돌림: 최고가 1R 이상 (%, 0 = 구분 없음)", self.spn_trail_1r),
-            ("트레일링 발동: 진입 후 최고 상승률 ≥ (%)", self.spn_trail_act, "", None),
+            ("트레일링 스탑 발동 상승률 (%, 진입 후 최고가 기준)", self.spn_trail_act, "", None),
             ("1회 매수 금액 (원)", self.spn_amount, "최대 동시 보유 종목", self.spn_maxpos),
             ("일 손실한도 (원, 도달 시 신규 매수 중단)", self.spn_maxloss, "일괄 청산 시각 (15:20 동시호가 전 권장)", self.te_eod),
         ]
@@ -595,33 +602,19 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("조합"), 2, 0)
         g.addWidget(self.cmb_logic, 2, 1)
 
-        self.te_vwap_end = tedit(c.vwap_end_time)
-        self.te_smc_start = tedit(c.smc_start_time)
-        self.te_smc_end = tedit(c.smc_end_time)
         self.cmb_stop_mode = QComboBox()
         self.cmb_stop_mode.addItems(["보호 저점(CHoCH 레그 최저가) 아래", "FVG 하단 아래"])
         self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
-        self.te_dsh_start = tedit(c.dsh_start_time)
-        self.te_dsh_end = tedit(c.dsh_end_time)
-        rows = [
-            ("C. VWAP 진입 마감", self.te_vwap_end, "F. SMC 손절 기준", self.cmb_stop_mode),
-            ("F. SMC 진입 시작", self.te_smc_start, "F. SMC 진입 마감", self.te_smc_end),
-            ("E. 진입 시작", self.te_dsh_start, "E. 진입 마감", self.te_dsh_end),
-        ]
-        for r, (l1, w1, l2, w2) in enumerate(rows, start=3):
-            g.addWidget(QLabel(l1), r, 0); g.addWidget(w1, r, 1)
-            if l2:
-                g.addWidget(QLabel(l2), r, 2)
-            g.addWidget(w2, r, 3)
-        for te in (self.te_vwap_end, self.te_smc_start, self.te_smc_end, self.te_dsh_start, self.te_dsh_end):
-            te.timeChanged.connect(self.on_settings_changed)
+        g.addWidget(QLabel("F. SMC 손절 기준"), 3, 0)
+        g.addWidget(self.cmb_stop_mode, 3, 1)
         self.cmb_stop_mode.currentIndexChanged.connect(self.on_settings_changed)
-        note = QLabel("A·B·D 는 위 '신규 진입 시작~마감', C 는 시작~VWAP 마감, E·F 는 자체 시간대를 씁니다. "
+        note = QLabel("진입 시간대는 위 '매매 규칙 파라미터'의 '신규 진입 시작~마감'을 씁니다 "
+                      "(단, C·F 의 신규 진입 마감은 14:00 고정). "
                       "손절·트레일링은 A~F 모두 위 '매매 규칙 파라미터' 값을 씁니다 (F 의 손절가만 전략 기준). "
                       "AND 는 신호가 크게 줄어듭니다. 세부값(눌림 폭·손절폭 범위·지정가 유효 봉 수)은 config.json")
         note.setStyleSheet("color: #8b949e;")
         note.setWordWrap(True)
-        g.addWidget(note, len(rows) + 3, 0, 1, 4)
+        g.addWidget(note, 4, 0, 1, 4)
         return box
 
     def _build_screener_box(self) -> QWidget:
@@ -717,9 +710,7 @@ class MainWindow(QMainWindow):
 
     def _make_screener(self, broker) -> AccumulationScreener:
         return AccumulationScreener(
-            broker, self._screener_cfg(), state_dir=APP_DIR,
-            log=lambda lv, m: self.append_log(lv, m) if QThread.currentThread() == self.thread()
-            else getattr(logger, lv if lv in ("info", "warning", "error") else "info")(m),
+            broker, self._screener_cfg(), state_dir=APP_DIR, log=self.scan_log.emit,
             condition_client_factory=lambda: KiwoomConditionClient(broker, raw_log_dir=LOG_DIR))
 
     def _temp_broker(self):
@@ -758,6 +749,9 @@ class MainWindow(QMainWindow):
         self.cmb_cond.blockSignals(False)
         self.save_screener()
         self.append_log("info", f"조건식 {len(conds)}개: {', '.join(nm for _, nm in conds)}")
+        # 현재 선택값이 그대로면 화면 변화가 없어 실패로 보이므로 결과를 바로 보여 준다
+        self.statusBar.showMessage(f"조건식 {len(conds)}개를 불러왔습니다", 5000)
+        self.cmb_cond.showPopup()
 
     def scan_now(self):
         if self.engine and self.worker and self.worker.isRunning():
@@ -773,10 +767,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "스캔", "키움 접속 실패 — 키와 모드를 확인하세요.")
             return
         self.btn_scan.setEnabled(False)
-        self.btn_scan.setText("스캔 중… (최대 1~2분)")
+        self.btn_scan.setText("스캔 중… 후보 조회")
+        self._scan_started = time.monotonic()
         self._scan_worker = ScanWorker(self._make_screener(broker), kst_now())
+        self._scan_worker.progress.connect(self.on_scan_progress)
         self._scan_worker.done.connect(self.on_scan_done)
         self._scan_worker.start()
+
+    def on_scan_progress(self, done: int, total: int):
+        left = ""
+        if done:
+            secs = (time.monotonic() - self._scan_started) / done * (total - done)
+            left = f" (약 {secs / 60:.0f}분 남음)" if secs >= 90 else f" (약 {secs:.0f}초 남음)"
+        self.btn_scan.setText(f"스캔 중… {done}/{total}{left}")
 
     def on_scan_done(self, res, err: str):
         self.btn_scan.setEnabled(True)
@@ -1236,12 +1239,7 @@ class MainWindow(QMainWindow):
         c.allow_reentry_same_day = not self.chk_no_reentry.isChecked()
         c.entry_strategies = [k for k in STRATEGY_KEYS if self.chk_strats[k].isChecked()]
         c.entry_logic = "AND" if self.cmb_logic.currentIndex() == 1 else "OR"
-        c.vwap_end_time = self.te_vwap_end.time().toString("HH:mm")
-        c.smc_start_time = self.te_smc_start.time().toString("HH:mm")
-        c.smc_end_time = self.te_smc_end.time().toString("HH:mm")
         c.smc_stop_mode = "fvg" if self.cmb_stop_mode.currentIndex() == 1 else "swing"
-        c.dsh_start_time = self.te_dsh_start.time().toString("HH:mm")
-        c.dsh_end_time = self.te_dsh_end.time().toString("HH:mm")
         if not c.entry_strategies:
             self.append_log("warning", "매수 전략이 하나도 선택되지 않았습니다 — 신규 매수 없음")
         if self.engine:
@@ -1253,9 +1251,7 @@ class MainWindow(QMainWindow):
     def _set_strategy_widgets(self, c):
         """on_settings_changed 의 반대 방향: 설정값 → 화면"""
         for te, hhmm in ((self.te_start, c.trade_start_time), (self.te_end, c.trade_end_time),
-                         (self.te_eod, c.eod_liquidation_time), (self.te_vwap_end, c.vwap_end_time),
-                         (self.te_smc_start, c.smc_start_time), (self.te_smc_end, c.smc_end_time),
-                         (self.te_dsh_start, c.dsh_start_time), (self.te_dsh_end, c.dsh_end_time)):
+                         (self.te_eod, c.eod_liquidation_time)):
             te.setTime(QTime.fromString(hhmm, "HH:mm"))
         for spn, val in ((self.spn_vol, c.min_volume_ratio), (self.spn_sl, c.stop_loss_rate),
                          (self.spn_trail, c.trailing_retrace_rate), (self.spn_trail_1r, c.trailing_retrace_rate_1r),
@@ -1538,11 +1534,28 @@ class MainWindow(QMainWindow):
         status_kr = {"BUYING": "매수 주문중", "HOLDING": "보유", "SELLING": "매도 주문중",
                      "CLOSED": "청산 완료", "FAILED": "미체결 취소"}
         for r, m in enumerate(trades):
+            entry = m["entry_price"]
+            # 수익률: 보유 중이면 현재가, 청산 완료면 청산가 기준
+            #   매수·매도 수수료(FEE_RATE)와 매도 거래세(TAX_RATE)를 뺀 순수익 ÷ 매입금액
+            if not entry or m["status"] in ("BUYING", "FAILED"):
+                ref = None
+            elif m["status"] == "CLOSED":
+                ref = m.get("exit_price") or None
+            else:
+                ref = quotes.get(m["symbol"])
+            rate = ((ref * (1 - FEE_RATE - TAX_RATE) - entry * (1 + FEE_RATE)) / entry * 100) if ref else None
             vals = (m["name"], m["order_id"], status_kr.get(m["status"], m["status"]), f"{m['qty']:,}",
-                    f"{m['entry_price']:,.0f}" if m["entry_price"] else "-", m["exit_reason"] or "-",
+                    f"{entry:,.0f}" if entry else "-", None, m["exit_reason"] or "-",
                     f"{m['realized_pnl']:+,.0f}" if m["status"] == "CLOSED" else "-")
             for c, v in enumerate(vals):
-                self.table_trades.setItem(r, c, _item(v))
+                if c == 5:
+                    if rate is None:
+                        self.table_trades.setItem(r, c, _item("-"))
+                    else:
+                        color = "#ff7b72" if rate > 0 else "#79c0ff" if rate < 0 else "#c9d1d9"
+                        self.table_trades.setItem(r, c, _item(f"{rate:+.2f}%", color=color))
+                else:
+                    self.table_trades.setItem(r, c, _item(v))
 
 
 def main():

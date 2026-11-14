@@ -11,6 +11,7 @@ Korea3MinBreakoutTrader - 매수 전략 조합 (AND / OR)
 
 조합 (StrategyConfig.entry_logic)
   OR  : 선택한 전략 중 하나라도 신호 → 그 신호로 진입 (같은 봉에 여럿이면 위 우선순위)
+        당일 신호를 낸 전략 수를 Signal.matched_strategies 에 담는다 → 엔진이 많은 종목부터 매수.
   AND : 선택한 전략이 '당일' 모두 한 번 이상 신호를 낸 시점(마지막 신호가 나온 봉)에 진입.
         진입 방식·손절은 마지막(이번 봉) 신호의 것을 쓴다.
         예) B + F: B 가 09:20 에 나고 F 셋업이 10:40 에 나오면 10:40 에 FVG 중간값 지정가 진입.
@@ -120,14 +121,17 @@ class EntryCombiner:
 
         trigger_key = next(k for k in keys if k in sigs)
         trigger = sigs[trigger_key]
+        parts = [f"{STRATEGY_LABELS[k]}@{fired[k].timestamp:%H:%M}" for k in keys if k in fired]
         if self.logic == "OR" or len(keys) == 1:
-            return trigger
+            if len(parts) < 2:
+                return trigger
+            return replace(trigger, matched_strategies=len(parts),
+                           reason=f"[OR {len(parts)}개 충족: {' · '.join(parts)}] {trigger.reason}")
 
         missing = [k for k in keys if k not in fired]
         if missing:
             logger.info(f"[{sym} {trigger.name}] AND 조합 대기: {STRATEGY_LABELS[trigger_key]} 충족, "
                         f"남은 조건 {', '.join(STRATEGY_LABELS[k] for k in missing)}")
             return None
-        parts = [f"{STRATEGY_LABELS[k]}@{fired[k].timestamp:%H:%M}" for k in keys]
-        return replace(trigger, strategy="+".join(keys),
+        return replace(trigger, strategy="+".join(keys), matched_strategies=len(parts),
                        reason=f"[AND 충족: {' · '.join(parts)}] {trigger.reason}")

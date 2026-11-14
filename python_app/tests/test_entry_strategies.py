@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta
 
 from python_app.engine.live_engine import EngineSettings, LiveTradingEngine
-from python_app.models.types import Bar, OrderType, Position, SignalType, StrategyConfig
+from python_app.models.types import Bar, OrderType, Position, Signal, SignalType, StrategyConfig
 from python_app.strategy.combiner import EntryCombiner
 from python_app.strategy.exit_rules import check_exit, trailing_stop_price
 from python_app.strategy.intraday import DaySwingHighBreakout, OrbHighBreakout, PrevHighBreakout, VwapPullback
@@ -61,8 +61,10 @@ def test_vwap_pullback_requires_prior_trend():
     assert feed(VwapPullback(StrategyConfig()), rows)[-1] is None
 
 
-def test_vwap_pullback_respects_end_time():
-    assert feed(VwapPullback(StrategyConfig(vwap_end_time="09:06")), VWAP_ROWS)[-1] is None
+def test_vwap_pullback_entry_end_fixed_at_1400():
+    strat = VwapPullback(StrategyConfig(trade_end_time="09:06"))
+    assert strat.end_time.strftime("%H:%M") == "14:00"
+    assert feed(strat, VWAP_ROWS)[-1] is not None       # 공통 마감(09:06)과 무관
 
 
 # ============================================================ D. 전일 고가 돌파
@@ -107,13 +109,20 @@ SMC_ROWS = [
 
 
 def test_smc_choch_then_first_fvg_midpoint_limit():
-    sigs = feed(SmcChochFvg(StrategyConfig()), SMC_ROWS)
+    sigs = feed(SmcChochFvg(StrategyConfig(trade_end_time="14:00")), SMC_ROWS)
     assert all(s is None for s in sigs[:-1])
     sig = sigs[-1]
     assert sig and sig.signal_type == SignalType.BUY_SMC_FVG and sig.order_type == OrderType.LIMIT
     assert sig.price == 9860                          # (9,830 + 9,890) / 2
     assert sig.stop_loss_price == 9740 - 10           # 보호 저점 - 1호가
     assert sig.expire_at == sig.timestamp + timedelta(minutes=30)
+
+
+def test_smc_entry_end_fixed_at_1400():
+    strat = SmcChochFvg(StrategyConfig(trade_end_time="10:00"))
+    assert strat.end_time.strftime("%H:%M") == "14:00"
+    sig = feed(strat, SMC_ROWS)[-1]
+    assert sig.expire_at == sig.timestamp + timedelta(minutes=30)     # 공통 마감(10:00)에 잘리지 않음
 
 
 def test_smc_fvg_stop_mode():
@@ -135,7 +144,7 @@ def test_smc_bullish_break_without_prior_bear_is_bos_not_choch():
 
 
 def test_smc_window():
-    assert feed(SmcChochFvg(StrategyConfig(smc_start_time="10:00")), SMC_ROWS)[-1] is None
+    assert feed(SmcChochFvg(StrategyConfig(trade_start_time="10:00", trade_end_time="14:00")), SMC_ROWS)[-1] is None
 
 
 def test_tick_size():
@@ -156,6 +165,43 @@ def test_or_returns_first_strategy_signal():
     assert sigs[1].strategy == "open_breakout" and sigs[2].strategy == "orb_high"
 
 
+def test_or_counts_strategies_fired_today():
+    sigs = feed(EntryCombiner(StrategyConfig(entry_strategies=["open_breakout", "orb_high"])), COMBO_ROWS)
+    assert sigs[1].matched_strategies == 1
+    assert sigs[2].matched_strategies == 2 and "OR 2개 충족" in sigs[2].reason
+    assert sigs[2].strategy == "orb_high"
+
+
+def _signal(symbol, matched):
+    return Signal(symbol, symbol, SignalType.BUY_BREAKOUT, 10000, START, 10000, 1000, 1000, 1.0, "테스트",
+                  matched_strategies=matched)
+
+
+def _poll_order(tmp_path, matched, screen_info=None):
+    """종목별 전략 충족 수(matched)로 한 번 조회했을 때 신호가 처리되는 종목 순서"""
+    config = StrategyConfig()
+    fake, clock = FakeKiwoom(), Clock(datetime(2026, 10, 20, 9, 6, 10))
+    eng = LiveTradingEngine(make_broker(fake, config=config), config, [(s, s) for s in matched],
+                            state_dir=str(tmp_path), clock=clock)
+    eng.trade_date = DAY
+    eng.screen_info = screen_info or {}
+    eng.broker.get_minute_bars = lambda sym, *a, **k: [Bar(sym, START, 10000, 10000, 10000, 10000, 1000)]
+    eng.strategy.process_bar = lambda bar, name: _signal(bar.symbol, matched[bar.symbol])
+    order = []
+    eng._on_signal = lambda sig, now: order.append(sig.symbol)
+    eng._poll_bars_if_due(clock())
+    return order
+
+
+def test_engine_buys_most_matched_strategies_first(tmp_path):
+    assert _poll_order(tmp_path, {"000001": 1, "000002": 3, "000003": 2}) == ["000002", "000003", "000001"]
+
+
+def test_engine_counts_accumulation_conditions_and_keeps_watch_order_on_tie(tmp_path):
+    info = {"000002": {"reasons": ["①", "②외국인", "②기관"]}, "000003": {"reasons": ["①"]}}
+    assert _poll_order(tmp_path, {"000001": 1, "000002": 1, "000003": 1, "000004": 1}, info) ==         ["000002", "000003", "000001", "000004"]
+
+
 def test_and_waits_until_all_strategies_fired():
     combo = EntryCombiner(StrategyConfig(entry_strategies=["orb_high", "open_breakout"], entry_logic="AND"))
     sigs = feed(combo, COMBO_ROWS)
@@ -170,8 +216,10 @@ def test_combiner_rejects_unknown_strategy_and_reports_last_entry_time():
         EntryCombiner(StrategyConfig(entry_strategies=["nope"]))
     with pytest.raises(ValueError):
         EntryCombiner(StrategyConfig(entry_logic="XOR"))
-    combo = EntryCombiner(StrategyConfig(entry_strategies=["open_breakout", "smc_fvg"]))
-    assert combo.last_entry_time().strftime("%H:%M") == "14:00"
+    combo = EntryCombiner(StrategyConfig(entry_strategies=["open_breakout", "smc_fvg"], trade_end_time="11:30"))
+    assert combo.last_entry_time().strftime("%H:%M") == "14:00"      # F 마감 14:00 고정이 가장 늦음
+    combo = EntryCombiner(StrategyConfig(entry_strategies=["open_breakout", "day_swing_high"], trade_end_time="11:30"))
+    assert combo.last_entry_time().strftime("%H:%M") == "11:30"
 
 
 # ============================================================ 청산 (전략 목표가 / 트레일링 끄기)
@@ -212,7 +260,7 @@ def _smc_engine(tmp_path, **cfg):
 
 
 def test_engine_places_limit_order_and_cancels_on_expiry(tmp_path):
-    fake, clock, eng, events = _smc_engine(tmp_path)
+    fake, clock, eng, events = _smc_engine(tmp_path, trade_end_time="14:00")
     buys = [o for o in fake.orders if o["side"] == "BUY"]
     assert len(buys) == 1
     assert buys[0]["body"]["trde_tp"] == "0" and buys[0]["body"]["ord_uv"] == "9860"
@@ -301,7 +349,7 @@ DSH_ROWS = [(10000, 10050, 9980, 10040, 100_000),
 
 
 def _dsh(**kw):
-    return DaySwingHighBreakout(StrategyConfig(dsh_start_time="09:00", **kw))
+    return DaySwingHighBreakout(StrategyConfig(**kw))
 
 
 def test_day_swing_high_signal_uses_global_stop():
@@ -324,7 +372,8 @@ def test_day_swing_high_needs_volume_and_consumes_level():
 
 
 def test_day_swing_high_respects_window():
-    assert feed(DaySwingHighBreakout(StrategyConfig()), DSH_ROWS)[-1] is None   # 기본 09:30 시작, 돌파는 09:18
+    # 공통 진입 시간대(trade_start_time) 밖이면 신호 없음 — 돌파는 09:18 봉
+    assert feed(DaySwingHighBreakout(StrategyConfig(trade_start_time="09:30")), DSH_ROWS)[-1] is None
 
 
 def _dsh_engine(tmp_path, **cfg):
@@ -335,7 +384,7 @@ def _dsh_engine(tmp_path, **cfg):
         fake.add_bar(SYM, (t0 + timedelta(minutes=3 * i)).strftime("%Y%m%d%H%M%S"), o, h, l, c, v)
     fake.prices[SYM] = 10000
     clock = Clock(datetime(2026, 10, 20, 9, 18, 5))
-    config = StrategyConfig(entry_strategies=["day_swing_high"], dsh_start_time="09:00", **cfg)
+    config = StrategyConfig(entry_strategies=["day_swing_high"], **cfg)
     eng = LiveTradingEngine(make_broker(fake, config=config), config, [(SYM, "삼성전자")], state_dir=str(tmp_path),
                             clock=clock, settings=EngineSettings(bar_poll_delay_sec=3))
     assert eng.start()

@@ -13,7 +13,7 @@ Korea3MinBreakoutTrader - 추가 매수 전략 (3분봉, 장중)
    - 추세 확인: 이전 봉 중 고가가 그 시점 VWAP × (1 + vwap_trend_pct%) 이상인 봉이 있었음
    - 눌림: 현재 봉 저가가 VWAP × (1 ± vwap_touch_pct%) 범위 안까지 내려옴
    - 반등: 현재 봉 양봉(종가 > 시가) + 종가 > VWAP
-   - 진입 시간대 trade_start_time ~ vwap_end_time
+   - 진입 시간대 trade_start_time ~ 14:00 (마감 고정, LATE_ENTRY_END_TIME)
 
 [D. 전일 고가 돌파 — prev_high]
    - 기준선 = 전일 일봉 고가 (엔진이 키움 일봉 ka10081 로 조회해서 넘겨줌)
@@ -23,7 +23,7 @@ Korea3MinBreakoutTrader - 추가 매수 전략 (3분봉, 장중)
 [E. 당일 전고점 돌파 — day_swing_high]
    - 전고점 = 가장 최근 확정된 당일 스윙 고점 (좌우 dsh_swing_len 봉보다 고가가 높은 봉, 오른쪽 N봉 완성 후 확정)
    - 종가가 전고점 위로 마감 + 거래량 조건(B와 동일). 돌파된 전고점은 소진 (거래량 미달이어도 다음 스윙을 기다림)
-   - 진입 시간대 dsh_start_time ~ dsh_end_time
+   - 진입 시간대 trade_start_time ~ trade_end_time
    - 청산: 손절·트레일링 모두 공통 설정
 
 공통: 시장가 진입, 손절 = 진입가 × (1 - stop_loss_rate%) (E는 위 값), 종목당 당일 1회 신호 (allow_reentry_same_day 제외)
@@ -40,6 +40,10 @@ logger = logging.getLogger("Korea3MinBreakoutTrader.Strategy")
 
 def parse_hhmm(hhmm: str) -> dtime:
     return datetime.strptime(hhmm, "%H:%M").time()
+
+
+# C(VWAP 눌림)·F(SMC) 신규 진입 마감 — 고정값. 시작은 공통 trade_start_time
+LATE_ENTRY_END_TIME = "14:00"
 
 
 class DayState:
@@ -165,7 +169,7 @@ class VwapPullback(BarStrategy):
 
     def _apply_config(self):
         super()._apply_config()
-        self.end_time = parse_hhmm(self.config.vwap_end_time)
+        self.end_time = parse_hhmm(LATE_ENTRY_END_TIME)
 
     def _evaluate(self, st: DayState, bar: Bar) -> Optional[Signal]:
         vwap = st.vwaps[-1]
@@ -223,10 +227,6 @@ class DaySwingHighBreakout(BarStrategy):
     key = "day_swing_high"
     label = "E.당일 전고점 돌파"
     signal_type = SignalType.BUY_DAY_SWING_HIGH
-
-    def _apply_config(self):
-        self.start_time = parse_hhmm(self.config.dsh_start_time)
-        self.end_time = parse_hhmm(self.config.dsh_end_time)
 
     def _update_swing(self, st: DayState):
         L = max(1, int(self.config.dsh_swing_len))

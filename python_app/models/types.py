@@ -104,6 +104,7 @@ class Signal:
     strategy: str = "open_breakout"  # 신호를 낸 전략 키 (AND 조합이면 'a+b')
     order_type: Optional[OrderType] = None  # None → MARKET. SMC 는 LIMIT (FVG 중간값 지정가)
     expire_at: Optional[datetime] = None  # 지정가 주문 유효 시각 (지나면 미체결 취소)
+    matched_strategies: int = 1     # 이 종목에서 당일 신호를 낸 매수 전략 수 (많을수록 먼저 매수)
 
     def __post_init__(self):
         if self.order_type is None:
@@ -246,19 +247,15 @@ class StrategyConfig:
     entry_strategies: List[str] = field(default_factory=lambda: ["open_breakout"])
     entry_logic: str = "OR"                 # OR = 하나라도 신호 → 진입 / AND = 선택 전략이 당일 모두 신호를 낸 시점에 진입
 
-    # C. VWAP 눌림 반등 (진입 시작은 trade_start_time)
-    vwap_end_time: str = "11:00"            # 신규 진입 마감
+    # 진입 시간대: 시작은 A~F 공통 trade_start_time, 마감은 A·B·D·E = trade_end_time / C·F = 14:00 고정
+    # C. VWAP 눌림 반등
     vwap_trend_pct: float = 1.0             # 눌림 전에 고가가 VWAP보다 N% 이상 위에 있었어야 함 (추세 확인)
     vwap_touch_pct: float = 0.3             # 저가가 VWAP ±N% 안까지 내려오면 '눌림'
 
-    # E. 당일 전고점 돌파: 자체 손절 (트레일링은 공통 trailing_* 사용)
-    dsh_start_time: str = "09:30"
-    dsh_end_time: str = "14:00"
+    # E. 당일 전고점 돌파 (청산은 공통 설정)
     dsh_swing_len: int = 2                  # 전고점 판정: 좌우 N봉보다 고가가 높아야 함
 
     # F. SMC: CHoCH → 첫 FVG 중간값 지정가 진입
-    smc_start_time: str = "09:30"
-    smc_end_time: str = "14:00"
     smc_swing_len: int = 2                  # 스윙 고/저점 판정: 좌우 N봉보다 높/낮아야 함
     smc_stop_mode: str = "swing"            # swing = CHoCH 전 스윙 저점 아래 / fvg = FVG 하단 아래
     smc_min_risk_pct: float = 0.3           # 손절폭(진입가 대비 %)이 이보다 작으면 생략 (수수료·호가 대비 의미 없음)

@@ -79,12 +79,13 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
   | `orb_high` | B. 첫 봉 고가 돌파 | 직전 봉 종가 ≤ 첫 봉 고가 < 현재 봉 종가 + 거래량 조건 | 시장가 |
   | `vwap_pullback` | C. VWAP 눌림 반등 | 고가가 VWAP +1% 이상 간 뒤, 저가가 VWAP ±0.3% 안으로 눌리고 양봉·VWAP 위 마감 | 시장가 |
   | `prev_high` | D. 전일 고가 돌파 | 직전 봉 종가 ≤ 전일 고가 < 현재 봉 종가 + 거래량 조건 (전일 고가는 일봉 ka10081) | 시장가 |
-  | `day_swing_high` | E. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 손절·트레일링 모두 공통 설정. 시간대 `dsh_start_time`~`dsh_end_time` | 시장가 |
+  | `day_swing_high` | E. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 손절·트레일링 모두 공통 설정 | 시장가 |
   | `smc_fvg` | F. SMC CHoCH → FVG | 하락 구조(스윙 저점 아래 마감) 뒤 스윙 고점 위 마감 = CHoCH → 그 뒤 처음 완성되는 상승 FVG | **FVG 중간값 지정가** |
 
   - **OR**: 하나라도 신호가 나면 진입 (같은 봉에 여럿이면 위 표 순서가 우선).
+  - **매수 순서**: 3분봉 조회 한 번에 나온 전 종목 신호를 모아, 충족 조건 수(당일 신호를 낸 매수 전략 수 + 매집 ①·② 해당 수)가 많은 종목부터 매수한다. 같으면 감시종목 순서. 조건이 적은 종목도 자리(`max_concurrent_positions`)가 남으면 매수하며, 이미 앞선 조회에서 찬 자리를 비우지는 않는다.
   - **AND**: 선택한 전략이 **당일 모두** 한 번 이상 신호를 낸 시점(마지막 신호 봉)에 진입. 진입 방식·손절은 마지막 신호 것을 쓴다. 신호가 크게 줄어든다.
-  - 시간대: A·B·D = `trade_start_time`~`trade_end_time`, C = `trade_start_time`~`vwap_end_time`, E = `dsh_start_time`~`dsh_end_time`, F = `smc_start_time`~`smc_end_time`. 엔진은 가장 늦은 마감까지 3분봉을 조회한다.
+  - 시간대: 시작은 A~F 모두 `trade_start_time`. 마감은 A·B·D·E = `trade_end_time`, C·F = 14:00 고정 (`LATE_ENTRY_END_TIME`). 엔진은 선택한 전략 중 가장 늦은 마감까지 3분봉을 조회한다.
   - 종목당 진입은 하루 1회 (`allow_reentry_same_day=false`). 엔진을 다시 켜도 그날 청산한 종목은 다시 사지 않는다.
 
   **F. SMC 세부** (봉은 당일 3분봉만 사용)
