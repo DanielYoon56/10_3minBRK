@@ -1,100 +1,88 @@
-# Korea3MinBreakoutTrader (국내 주식 첫 3분봉 돌파 자동매매 시스템)
+# 2WAYTRADING (국내 주식 자동매매 시스템)
 
-Windows 데스크톱 독립형 자동매매 애플리케이션 (Python 3.11+ / PySide6 / SQLite / Kiwoom REST API)
+> **OPEN · CLOSE 2대 전략 체제** — 장중 가짜 돌파로 손실이 잦던 장중(INTRADAY) 전략을 완전히 폐기하고,
+> 시장 거래가 집중되는 **OPEN**(장 초반 단타)과 전 기간 유일하게 일관된 흑자를 입증한 **CLOSE**(장 마감 전 종가베팅/스윙) 2대 핵심 전략 체제로 집중 운용합니다.
+> 진입 조건의 기본값은 **검증 전 기본값**입니다. 모의거래에서는 바로 동작하지만, **실거래에서는
+> `config.json` 의 `strategies.<전략>.live_enabled` 를 직접 `true` 로 바꾼 전략만 신규 매수**합니다.
 
 ---
 
-## 1. 개요 및 트레이딩 전략 정의
+## 1. 구조
 
-전략 이름: `First3MinuteCandleBreakout`
-
-### 원본 강세 수식 분석:
 ```text
-crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1), V(1))
+순위 조회(ka10030·ka10027) ─> CandidateScanner ─> 후보 목록(순위)
+                                                     │
+3분봉 조회(ka10080, 완성 봉) ─> BarStore 저장 ─> SymbolSession (종목별 당일 상태)
+                                                     │
+                              StrategyManager ─> OPEN / CLOSE (각자 판정)
+                                                     │  StrategySignal
+                              LiveTradingEngine (진입 조건 검사 · 주문 · 청산) ─> 키움
 ```
 
-### HTS 수식과 본 시스템 구현 간 차이점:
-- **HTS 인덱싱 오류 방지**: 키움증권 영웅문 등의 수식관리자에서 `date != date(1)` 조건은 당일 첫 봉에서 참이 되지만, 그 시점에서 `C(1)`이나 `V(1)`을 참조하면 **당일 첫 봉이 아니라 전일 종가(전일 마지막 봉)**를 참조하는 논리적 함정이 발생합니다.
-- **본 시스템의 명확한 정의**:
+- **전략은 신호만 냅니다.** 주문은 엔진만 냅니다 (`strategies/` 안에는 주문 호출이 없습니다).
+- **전략은 서로 독립입니다.** 진입(`on_bar`)·청산(`check_exit`)·설정·통계를 전략마다 따로 가집니다.
+  같은 종목에 여러 전략이 신호를 내도 주문은 한 번이고, 먼저 승인된 전략이 그 포지션을 소유해 청산까지 판정합니다.
+- **완성된 3분봉만** 씁니다. 진행 중인 봉·시간외 봉·중복 봉은 `SymbolSession`이 받지 않습니다.
+  키움은 체결이 없던 3분 구간의 봉을 보내지 않으므로 빈 구간 수(`gaps`)를 유동성 지표로 남깁니다.
+- 실거래와 백테스트가 같은 `SymbolSession`·전략 코드를 씁니다 (`backtest/replay.py`).
 
-#### 매수 — 3분봉 시가돌파 + 거래량 충족
-  1. 매 거래일 첫 번째 3분봉(09:00~09:03 KST)을 확정합니다.
-  2. 첫 3분봉의 **시가**를 `breakout_level`, 거래량을 `first_bar_volume`으로 저장합니다. (첫 봉 자체에서는 신호 없음)
-  3. 이후 봉(09:03 이후)에서:
-     - `cross_up = previous_close <= breakout_level AND current_close > breakout_level`
-     - `volume_confirmed = current_bar_volume > first_bar_volume × min_volume_ratio` (기본 0.7 → 첫 봉 거래량의 70% 초과)
-     - `bullish_signal = cross_up AND volume_confirmed`
-  4. 지정 시간대(기본 09:03 ~ 10:00) 내, 종목당 당일 1회만 진입합니다.
-  5. HTS 수식 표현: `crossup(C, valuewhen(1, date!=date(1), O)) && V > valuewhen(1, date!=date(1), V)`
+### WAY 1 — OPEN 전략 (`strategies/open_strategy.py`)
+장 초반(`start_time`~`end_time`, 기본 09:06~09:45)에 완성된 3분봉으로 판정합니다. 갭이 크다는 이유만으로는 사지 않습니다.
 
-#### 매도 — 손절 -2% / 트레일링 스탑 1R 미만 50%·1R 이상 30% (`strategy/exit_rules.py`)
-  | 우선순위 | 조건 | 계산 |
-  |---|---|---|
-  | 1 | 손절 | 현재가 ≤ 진입가 × (1 − 2%) |
-  | 2 | 트레일링 스탑 | 최고가가 진입가 대비 **+1% 이상** 오른 뒤부터: 현재가 ≤ 최고가 − (최고가 − 진입가) × 되돌림. 되돌림 = 최고가 상승폭이 **1R 미만이면 50%, 1R 이상이면 30%** |
-  | 3 | 고정 익절 (옵션) | `take_profit_rate > 0`일 때만. 기본 0 = 미사용 |
+| 패턴 | 조건 (모두 충족) | 손절 기준 |
+|---|---|---|
+| A. 시초 범위 돌파 `orb` | 첫 `or_bars`봉 고가를 종가로 상향 돌파 · 양봉 · VWAP 위 · 거래량 ≥ 범위 봉 평균 × `orb_vol_ratio` | 돌파 봉 저가 |
+| B. 시초 눌림 `pullback` | 상승폭 ≥ `pb_min_impulse_pct`% · 되돌림 `pb_min_retrace`~`pb_max_retrace` · 눌림 거래량 감소 · VWAP 지지 · 직전 봉 고가 위 양봉 | 눌림 저가 |
+| C. 모멘텀 지속 `momentum` | 시가 대비 ≥ `mo_min_gain_pct`% · 최근 `mo_bars`봉 저점 상승·VWAP 위·거래량 유지 · 종가 당일 신고가 | 최근 봉 최저가 |
 
-  트레일링 값은 [매매 규칙 파라미터]에서만 설정하며 A~F 전략에 공통으로 적용됩니다.
+### WAY 2 — CLOSE 전략 (`strategies/close_strategy.py`)
+장 마감 전(`start_time`~`end_time`, 기본 14:48~15:15)에 주봉(추세) → 일봉(셋업) → 3분봉(막판 매수세)의 3단계 검증 후 익일 오버나이트 스윙 진입을 판정합니다.
 
-  1R = 진입가 − 손절가 (종목별). 구간은 현재가가 아니라 **최고가**로 판정하므로, 한 번 1R에 닿으면 30%가 유지되고 청산선은 내려가지 않습니다.
+| 단계 | 조건 |
+|---|---|
+| 1. 주봉 (`analyze_weekly`) | 주봉 정배열 + 중기 이평 상승(BULLISH) 또는 명확한 추세 |
+| 2. 일봉 (`analyze_daily`) | 20일선 우상향 중 돌파 셋업(BREAKOUT_SETUP) 또는 20일선 눌림 회복(PULLBACK) 또는 정배열(UPTREND) |
+| 3. 3분봉 (`analyze_3min`) | VWAP 위 마감 · 당일 고가권(상단 70% 이상) 유지 · 막판 매수 우위 거래량 및 급락 없음 |
 
-  예) 진입 10,000원, 손절 9,800원(1R = 200원) → 최고 10,150원(1R 미만) → 상승분 150의 50% → **10,075원 이하**에서 전량 청산.
-  예) 같은 조건 → 최고 11,000원(1R 이상) → 상승분 1,000의 30% → **10,700원 이하**에서 전량 청산.
-  최고가가 +1%(10,100원)에 한 번도 닿지 않았으면 트레일링은 작동하지 않고 손절선(9,800원)만 유효합니다.
-  예) 진입 10,000원 → 최고 10,080원(+0.8%) → 다시 10,000원: 트레일링 미발동 → 보유 유지
+- **오버나이트 청산**: 다음 거래일 09:00부터 손절/트레일링을 감시하며, 지정 시각(`exit_time`, 기본 10:30)까지 도달 시 시장가 일괄 청산 (최대 1일 보유).
 
-#### 주요 설정 (`config.example.json` / `StrategyConfig`)
-  | 키 | 기본값 | 설명 |
-  |---|---|---|
-  | `breakout_reference` | `"open"` | `"close"`로 바꾸면 구버전(첫 봉 종가 돌파) |
-  | `min_volume_ratio` | `0.7` | 돌파 봉 거래량 > 첫 봉 거래량 × 배수 (70% 초과) |
-  | `stop_loss_rate` | `2.0` | 손절 % |
-  | `trailing_retrace_rate` | `50.0` | 최고가 1R 미만일 때 상승분 되돌림 % (0 = 트레일링 끔) |
-  | `trailing_retrace_rate_1r` | `30.0` | 최고가 1R 이상일 때 상승분 되돌림 % (0 = 구간 구분 없음) |
-  | `trailing_activation_rate` | `1.0` | 트레일링 발동: 진입 후 최고가가 +1% 이상 올라야 적용 |
-  | `take_profit_rate` | `0.0` | 고정 익절 % (0 = 끔) |
-  | `use_first_bar_low_stop` | `false` | 첫 봉 저가 이탈 즉시 손절 병행 |
+### 자금 관리 및 위험 통제 (`risk/capital_guard.py`)
+- 일일 손실 한도(`max_daily_loss`) 도달 시 자동 신규 매수 차단.
+- 1R 리스크 기반 포지션 사이징 및 오버나이트 총 노출 한도 제어.
 
-#### 매집 종목 차트 (`chart_dialog.py`)
-  감시 종목 표에서 종목을 고르고 [차트 보기]를 누르거나 더블클릭하면 차트가 열린다. 창의 버튼으로 일·주·월봉과 3·5·15분봉을 바꿔 본다 (일·주·월 최근 60봉, 분봉 최근 130봉).
-  보유 / 관리 종목 표를 더블클릭해도 열린다. 보유 종목이면 매수가(흰색)·손절가(적색)·익절가(녹색)를 매수 봉에서 오른쪽 끝까지 뻗는 선으로 표시한다. 익절가는 차트에서 정한 목표가 → 고정 익절 % → 발동한 트레일링가 순이며, 앱이 관리하지 않는 기존 보유는 매수가만 표시한다.
-  트레일링을 끈 상태(`trailing_retrace_rate` 0)에서는 자동매매 실행 중에 전략과 상관없이 앱 관리 보유 종목의 적색 손절선과 녹색 익절선을 마우스로 끌어 옮길 수 있다 (익절선은 고정 익절 `take_profit_rate` 를 쓸 때만 표시). 놓으면 호가 단위로 내림한 가격을 확인창으로 묻고, 승인하면 바로 청산 기준에 적용되어 재시작 후에도 유지된다. 손절가는 현재가 미만, 익절가는 현재가 초과로만 옮길 수 있다. 트레일링을 켜면 옮겨도 의미가 없어 선이 고정된다. 손절선을 옮겨도 1R 기준은 처음 세팅한 손절가 그대로다.
-  노란 막대 = 매집 판단일이 포함된 봉, 선 = 직전 20봉 평균 거래량. 주·월봉은 일봉(ka10081)을 합쳐서 만든다.
-  자동매매 시작 전에도 가장 최근 스캔 결과(`screen_날짜.json`)가 표에 표시된다.
+패턴이 맞아도 다음이면 진입하지 않습니다: 첫 봉 없음 · 전일 일봉 없음 · 갭 과다 · 빠진 봉 과다(유동성) · 누적 거래대금 부족 ·
+지수 약세 · 지수 대비 상대강도 부족 · 과열(전일 대비·VWAP 이격) · 손절폭 과다 · 저항(전일 고가·상한가)까지 여유 부족.
+손절가는 손절 기준 - 1호가이며, 지수 조회에 실패하면 지수 조건은 판정하지 않습니다.
 
-#### 저장된 매매 규칙 (`config.json`의 `rule_presets`)
-  GUI [전략 설정] 맨 위에서 현재 규칙을 이름 붙여 저장하고, 골라서 [적용]으로 불러온다.
+### 백테스트 (`backtest/`)
+```cmd
+:: 1) 과거 데이터 받기 (조회 전용, 중단 후 다시 실행하면 이어받음) → python_app\history.db
+.venv\Scripts\python.exe python_appacktest\download.py all --top 150
+:: 2) 재생 — 설정은 실거래와 같은 config.json. --split 날짜부터는 검증 구간으로 따로 보고
+.venv\Scripts\python.exe python_appacktestun.py --split 2026-07-01
+```
+- 재생은 실거래와 같은 전략·세션·후보 순위·청산 규칙 코드를 씁니다 (`backtest/replay.py`).
+- **미래 정보 차단**: 시각 t 의 판정에는 그 시각까지 마감된 봉만 쓰고, 신호 다음 봉의 시가에 체결합니다.
+- **체결 가정**: 매수·매도 각 1호가 불리하게, 수수료·거래세 차감. 봉 안에서는 시가 → 저가 → 고가 → 종가 순(손절 우선).
+- **한계**: 현재 상장 종목만(생존 편향), 받아 둔 종목 안에서만 후보를 고름, 청산을 2초 시세가 아닌 3분봉으로 판정,
+  부분 체결 미반영. 검증 구간 결과를 보고 값을 고치면 그 구간은 더 이상 검증 구간이 아닙니다.
 
-  - 저장 범위: `StrategyConfig` 전체 (매매 규칙 파라미터 + 매수 전략 + 화면에 없는 세부값). 감시종목 선정 기준은 포함하지 않는다.
-  - 콤보에서 고르기만 해서는 바뀌지 않고 [적용]을 눌러야 반영된다. 적용 후 값을 고치면 '저장 안 됨'으로 표시되며 프리셋 자체는 그대로다.
-  - 가동 중 적용은 즉시 반영된다. 실거래 가동 중이면 적용될 규칙을 보여 주고 확인을 받는다.
-  - 가동 중 새로 켠 전략은 그때부터 받는 봉만 보므로 첫 봉 기준이 달라진다 → 장 시작 전에 적용할 것.
+### 매도 — 기본 청산 규칙 (`strategy/exit_rules.py`)
+전략이 따로 정하지 않으면 공통 규칙을 씁니다: 손절 → 트레일링 스탑 → 목표가.
+- 손절가: 전략이 준 구조 기반 손절가. 없으면 매입가 × (1 - `stop_loss_rate`%).
+- 트레일링: 최고가가 `trailing_activation_rate`% 이상 오른 뒤, 상승분의 `trailing_retrace_rate`%
+  (최고가 1R 이상이면 `trailing_retrace_rate_1r`%)를 되돌리면 청산. 1R = 매입가 - 손절가.
+- 전략별로 `config.json`의 `strategies.<전략>.exit`에서 위 값을 덮어쓸 수 있습니다.
+- 오버나이트 보유 신호(`hold_overnight`)로 산 종목은 매수한 날의 장 마감 일괄 청산과 다음 날 시초 청산에서 제외되고,
+  다음 거래일 장 마감에는 청산됩니다 (최대 1일 보유).
 
-#### 추가 매수 전략 + AND/OR 조합 (`strategy/combiner.py`, `intraday.py`, `smc.py`)
-  GUI [전략 설정] → '매수 전략'에서 여러 개를 고르고 조합을 정한다 (`entry_strategies`, `entry_logic`).
-
-  | 키 | 전략 | 신호 | 진입 |
-  |---|---|---|---|
-  | `open_breakout` | A. 첫 봉 시가 돌파 (기존) | 위 설명 | 시장가 |
-  | `orb_high` | B. 첫 봉 고가 돌파 | 직전 봉 종가 ≤ 첫 봉 고가 < 현재 봉 종가 + 거래량 조건 | 시장가 |
-  | `vwap_pullback` | C. VWAP 눌림 반등 | 고가가 VWAP +1% 이상 간 뒤, 저가가 VWAP ±0.3% 안으로 눌리고 양봉·VWAP 위 마감 | 시장가 |
-  | `prev_high` | D. 전일 고가 돌파 | 직전 봉 종가 ≤ 전일 고가 < 현재 봉 종가 + 거래량 조건 (전일 고가는 일봉 ka10081) | 시장가 |
-  | `day_swing_high` | E. 당일 전고점 돌파 | 가장 최근 당일 스윙 고점(좌우 `dsh_swing_len`봉보다 높은 고가) 위로 종가 마감 + 거래량 조건. 청산: 손절·트레일링 모두 공통 설정 | 시장가 |
-  | `smc_fvg` | F. SMC CHoCH → FVG | 하락 구조(스윙 저점 아래 마감) 뒤 스윙 고점 위 마감 = CHoCH → 그 뒤 처음 완성되는 상승 FVG | **FVG 중간값 지정가** |
-
-  - **OR**: 하나라도 신호가 나면 진입 (같은 봉에 여럿이면 위 표 순서가 우선).
-  - **매수 순서**: 3분봉 조회 한 번에 나온 전 종목 신호를 모아, 충족 조건 수(당일 신호를 낸 매수 전략 수 + 매집 ①·② 해당 수)가 많은 종목부터 매수한다. 같으면 감시종목 순서. 조건이 적은 종목도 자리(`max_concurrent_positions`)가 남으면 매수하며, 이미 앞선 조회에서 찬 자리를 비우지는 않는다.
-  - **AND**: 선택한 전략이 **당일 모두** 한 번 이상 신호를 낸 시점(마지막 신호 봉)에 진입. 진입 방식·손절은 마지막 신호 것을 쓴다. 신호가 크게 줄어든다.
-  - 시간대: 시작은 A~F 모두 `trade_start_time`. 마감은 A·B·D·E = `trade_end_time`, C·F = 14:00 고정 (`LATE_ENTRY_END_TIME`). 엔진은 선택한 전략 중 가장 늦은 마감까지 3분봉을 조회한다.
-  - 종목당 진입은 하루 1회 (`allow_reentry_same_day=false`). 엔진을 다시 켜도 그날 청산한 종목은 다시 사지 않는다.
-
-  **F. SMC 세부** (봉은 당일 3분봉만 사용)
-  - 스윙 고/저점: 좌우 `smc_swing_len`(2)봉보다 높/낮은 봉. 하락 구조 없이 위로 깨는 것은 BOS 로 보고 진입하지 않는다.
-  - CHoCH 이후 **첫 FVG 하나만** 본다. 이 FVG 가 손절폭 조건을 못 맞추면 그 CHoCH 는 건너뛴다.
-  - 진입가 = FVG 중간값(호가 단위 내림), 손절가 = 보호 저점(마지막 하락 전환 ~ CHoCH 사이 최저가) − 1호가 (`smc_stop_mode="fvg"` 면 FVG 하단 − 1호가)
-  - 손절폭이 `smc_min_risk_pct`(0.3%) 미만·`smc_max_risk_pct`(3%) 초과면 생략.
-  - 지정가는 `smc_fvg_expiry_bars`(10봉 = 30분) 안에 체결 안 되면 취소, 체결 전 현재가가 손절가 이하로 내려가도 취소. 부분 체결 후 유효시간이 끝나면 잔량만 취소.
-  - 청산: 손절가만 전략 값이고 트레일링·장 마감 일괄 청산 등 나머지는 공통.
+### 주요 설정 (`config.example.json`)
+| 묶음 | 내용 |
+|---|---|
+| 최상위 (`StrategyConfig`) | 공통 청산 규칙·자금 관리: `stop_loss_rate`, `trailing_*`, `eod_liquidation*`, `order_amount_per_trade`, `max_concurrent_positions`, `max_daily_loss` |
+| `scanner` | 실시간 후보 탐색: 후보 수, 주가·거래대금·등락률 범위, 순위 가중치 (기본값은 검증 전 임시값) |
+| `strategies` | 전략별 설정 (`open` / `close`) — 2대 핵심 전략 설정 |
+| `rule_presets` | 공통 매매 설정에 이름을 붙여 보관한 사본 |
 
 ---
 
@@ -125,8 +113,8 @@ crossup(C, valuewhen(1, date!=date(1), C(1))) && V > valuewhen(1, date!=date(1),
 ### 3) 동작 방식 (`engine/live_engine.py`)
 | 주기 | 하는 일 | 키움 TR |
 |---|---|---|
-| 3분봉 마감 4초 후 (09:03:04, 09:06:04 …) | 감시종목 3분봉 조회 → 전략 판정 → 신호 시 시장가 매수 | ka10080 → kt10000 |
-| 2초마다 | 앱이 매수한 종목 현재가 → 손절 -2% / 트레일링(+1% 이상 상승 후 1R 미만 50%·1R 이상 30%) → 시장가 매도 | ka10001 → kt10001 |
+| 3분봉 마감 4초 후 (09:03:04, 09:06:04 …) | 후보 순위 재조회 → 감시종목 3분봉 조회·기록 → 전략별 판정 → 신호 시 매수 | ka10030·ka10027 → ka10080 → kt10000 |
+| 2초마다 | 앱이 매수한 종목 현재가 → 소유 전략의 청산 판정(손절 / 트레일링 / 목표가) → 시장가 매도 | ka10001 → kt10001 |
 | 15초마다 | 잔고·주문가능금액 동기화, 체결 확인 | kt00018, kt00001 |
 | 주문 후 30초 미체결 | 주문 취소 (매도는 다음 주기 재시도) | ka10075 → kt10003 |
 
@@ -177,14 +165,18 @@ Korea3minTrader/
     ├── app_config.py           # config.json 로드/저장 (앱키·텔레그램 토큰 포함, 공유 금지)
     ├── engine/live_engine.py   # 실시간 자동매매 루프 (분봉→신호→주문→청산→알림)
     ├── notify/telegram.py      # 텔레그램 알림 (백그라운드 전송)
-    ├── strategy/breakout.py    # 3분봉 시가돌파 매수 판정
-    ├── strategy/intraday.py    # A 첫 봉 고가 / B VWAP 눌림 / C 전일 고가 돌파
-    ├── strategy/smc.py         # SMC CHoCH → 첫 FVG 중간값 지정가
-    ├── strategy/combiner.py    # 매수 전략 AND/OR 조합
-    ├── strategy/exit_rules.py  # 손절 -2% / 트레일링 (1R 미만 50%, 1R 이상 30%)
+    ├── strategies/base_strategy.py      # StrategySignal · SymbolSession · BaseStrategy (전략 공통 인터페이스)
+    ├── strategies/candidate_scanner.py  # 실시간 후보 탐색·순위
+    ├── strategies/strategy_manager.py   # 전략별 호출·중복 신호 차단·전략별 통계
+    ├── strategies/indicators.py         # 공용 계산 (호가 단위 등)
+    ├── backtest/bar_store.py            # 3분봉·후보 기록 (bars.db)
+    ├── backtest/download.py             # 과거 일봉·3분봉·지수 내려받기 (history.db)
+    ├── backtest/replay.py               # 재생 엔진 (실거래와 같은 전략 코드, 다음 봉 시가 체결)
+    ├── backtest/metrics.py / run.py     # 성과 지표 · 실행
+    ├── strategies/open_strategy.py      # WAY 1 OPEN: 시초 범위 돌파 · 시초 눌림 · 모멘텀 지속
+    ├── strategy/exit_rules.py  # 공통 청산 규칙: 손절 / 트레일링 (1R 미만 50%, 1R 이상 30%) / 목표가
     ├── broker/kiwoom_rest.py   # 키움증권 REST API (모의 mockapi / 실거래 api.kiwoom.com)
-    ├── broker/kiwoom_condition.py  # 키움 조건검색 (웹소켓: LOGIN · CNSRLST · CNSRREQ)
-    ├── screener/accumulation.py    # 감시종목 선정: 조건식 AND (① 거래량·캔들 OR ② 외국인 AND 기관 순매수)
+    ├── broker/kiwoom_condition.py  # 키움 조건검색 (웹소켓: LOGIN · CNSRLST · CNSRREQ) — 현재 미사용
     ├── broker/paper.py         # 오프라인 모의 브로커 (테스트용)
     ├── models/types.py         # 데이터 모델 · 전략 설정값
     ├── db/storage.py           # SQLite 기록

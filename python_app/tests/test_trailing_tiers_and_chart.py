@@ -1,4 +1,4 @@
-"""트레일링 되돌림 구간(1R 미만/이상), 설정 이전, 스캔 결과 재사용, 일봉 차트"""
+"""트레일링 되돌림 구간(1R 미만/이상), 설정 이전, 일봉 차트"""
 import json
 import os
 from datetime import datetime
@@ -9,7 +9,6 @@ from python_app.app_config import (
     load_config, matching_rule_preset, rule_preset_config, save_config, strategy_config_from,
 )
 from python_app.models.types import Position, SignalType, StrategyConfig
-from python_app.screener.accumulation import ScreenHit, ScreenResult, latest_cached
 from python_app.strategy.exit_rules import check_exit, reached_1r, trailing_stop_price
 
 
@@ -88,7 +87,7 @@ def test_v3_config_drops_per_strategy_trailing_keys(tmp_path):
     path.write_text(json.dumps({"config_version": 3, "dsh_stop_rate": 2.0, "dsh_trail_retrace_rate": 50.0,
                                 "dsh_trail_activation_rate": 1.0, "smc_use_trailing": True}), encoding="utf-8")
     cfg = load_config(str(path))
-    assert cfg["config_version"] == 6
+    assert cfg["config_version"] == 7
     assert not {"dsh_trail_retrace_rate", "dsh_trail_activation_rate", "smc_use_trailing"} & set(cfg)
     strategy_config_from(cfg)
 
@@ -107,21 +106,6 @@ def test_user_values_after_migration_are_kept(tmp_path):
     save_config(cfg, path)
     sc = strategy_config_from(load_config(path))
     assert (sc.trailing_retrace_rate, sc.trailing_retrace_rate_1r) == (40.0, 20.0)
-
-
-# ------------------------------------------------------------------ 저장된 스캔 결과
-def _write_screen(folder, day, prev):
-    res = ScreenResult(trade_date=day, prev_date=prev, created_at="20:00:00",
-                       hits=[ScreenHit("005930", "삼성전자", ["①"], detail="거래량 3.0배")])
-    (folder / f"screen_{day}.json").write_text(json.dumps(res.to_json()), encoding="utf-8")
-
-
-def test_latest_cached_picks_newest_readable_file(tmp_path):
-    assert latest_cached(str(tmp_path)) is None
-    _write_screen(tmp_path, "20261104", "20261103")
-    _write_screen(tmp_path, "20261105", "20261104")
-    (tmp_path / "screen_20261106.json").write_text("{broken", encoding="utf-8")
-    assert latest_cached(str(tmp_path)).trade_date == "20261105"
 
 
 # ------------------------------------------------------------------ 차트
@@ -155,8 +139,8 @@ def window(tmp_path, monkeypatch):
 
     app = QApplication.instance() or QApplication([])
     path = str(tmp_path / "config.json")
-    save_config({"kiwoom": {"mock": {"app_key": "k", "secret_key": "s"}}}, path)
-    _write_screen(tmp_path, "20261105", "20261104")
+    save_config({"kiwoom": {"mock": {"app_key": "k", "secret_key": "s"}}, "scanner": {"enabled": False},
+                 "watchlist": [{"symbol": "005930", "name": "삼성전자"}]}, path)
     monkeypatch.setattr(app_main, "APP_DIR", str(tmp_path))
     monkeypatch.setattr(app_main, "load_config", lambda: load_config(path))
     monkeypatch.setattr(app_main, "save_config", lambda cfg: save_config(cfg, path))
@@ -194,21 +178,27 @@ class _Broker:
                  "close": 105, "volume": 500} for i in range(150)]
 
 
-def test_watch_table_lists_latest_scan_before_trading_starts(window):
+def test_watch_table_lists_fixed_symbols_before_trading_starts(window):
     assert window.table_watch.rowCount() == 1
     assert window.table_watch.item(0, 0).text() == "005930"
-    assert window.table_watch.item(0, 2).toolTip() == "거래량 3.0배"
-    assert "기준일 20261104" in window.wl_box.title()
+    assert "고정 1종목" in window.wl_box.title()
 
 
-def test_double_click_opens_chart_with_judgement_day(window, monkeypatch):
+def test_watch_table_is_empty_until_start_when_scanner_is_on(window):
+    window.chk_scan.setChecked(True)
+    assert window.table_watch.rowCount() == 0
+    assert "실시간 후보 탐색" in window.wl_box.title()
+    assert window.cfg["scanner"]["enabled"] is True
+
+
+def test_double_click_opens_chart(window, monkeypatch):
     broker = _Broker(_bars(70))
     monkeypatch.setattr(window, "_temp_broker", lambda: broker)
     window.open_chart(0)
     _wait_for_chart(window)
     assert broker.calls[0][0] == "005930"
     assert window.chart.isVisible() and window.chart.lbl_title.text() == "삼성전자 (005930)"
-    assert window.chart._judge_dt == "20261104"
+    assert window.chart._judge_dt == ""
     assert len(window.chart.view.chart().series()) == 3
 
 
@@ -719,7 +709,7 @@ def test_v4_config_drops_per_strategy_exit_keys(tmp_path):
                                 "rule_presets": {"ST1": {"dsh_stop_rate": 2.0, "smc_rr": 4.0, "stop_loss_rate": 2.0}}}),
                     encoding="utf-8")
     cfg = load_config(str(path))
-    assert cfg["config_version"] == 6 and cfg["stop_loss_rate"] == 1.5
+    assert cfg["config_version"] == 7 and cfg["stop_loss_rate"] == 1.5
     assert not {"dsh_stop_rate", "smc_rr"} & set(cfg)
     assert cfg["rule_presets"]["ST1"] == {"stop_loss_rate": 2.0}
     strategy_config_from(cfg)
@@ -800,7 +790,6 @@ def _real_start_setup(window, monkeypatch, answer):
     worker = MagicMock()
     for name, stub in (("KiwoomRestBroker", MagicMock()), ("LiveTradingEngine", MagicMock()), ("EngineWorker", worker)):
         monkeypatch.setattr(module, name, stub)
-    monkeypatch.setattr(window, "_make_screener", lambda broker: None)
     return asked, worker
 
 

@@ -33,11 +33,11 @@ class FakeKiwoom:
         self.unfilled: Dict[str, dict] = {}
         self.fail_token = False
         self._ord_seq = 1000
-        # 매집 스캔용
-        self.prev_top: Dict[str, List[dict]] = {"1": [], "2": []}   # ka10031 qry_tp별 [{"stk_cd","stk_nm"}]
-        self.today_top: Dict[str, List[dict]] = {"1": [], "3": []}  # ka10030 sort_tp별 (20시 스캔)
+        # 후보 탐색용 순위
+        self.today_top: Dict[str, List[dict]] = {"1": [], "3": []}  # ka10030 sort_tp별 (1=거래량, 3=거래대금)
+        self.change_top: List[dict] = []                           # ka10027 등락률 상위
+        self.index_rates: Dict[str, str] = {"001": "+0.00", "101": "+0.00"}   # ka20001 지수 등락률
         self.daily: Dict[str, List[dict]] = {}                     # ka10081 sym → 최신순 일봉
-        self.frgn_inst_rows: List[dict] = []                       # ka90009 행
         self.mac: Dict[str, str] = {}                              # ka10001 시가총액 (문자열 그대로)
         self.fail_apis = set()
 
@@ -71,17 +71,16 @@ class FakeKiwoom:
                                   "high_pric": f"+{p}", "low_pric": f"-{p}", "base_pric": str(p),
                                   "flu_rt": "-0.50", "trde_qty": "0000000012345",
                                   "mac": self.mac.get(sym, "0"), "return_code": 0})
-        if api == "ka10031":
-            return FakeResp(200, {"pred_trde_qty_upper": self.prev_top.get(body["qry_tp"], []), "return_code": 0},
-                            {"cont-yn": "N"})
+        if api == "ka20001":
+            return FakeResp(200, {"cur_prc": "+2500.00", "flu_rt": self.index_rates[body["inds_cd"]], "return_code": 0})
+        if api == "ka10027":
+            return FakeResp(200, {"pred_pre_flu_rt_upper": self.change_top, "return_code": 0}, {"cont-yn": "N"})
         if api == "ka10030":
             return FakeResp(200, {"tdy_trde_qty_upper": self.today_top.get(body["sort_tp"], []), "return_code": 0},
                             {"cont-yn": "N"})
         if api == "ka10081":
             return FakeResp(200, {"stk_cd": body["stk_cd"], "stk_dt_pole_chart_qry": self.daily.get(body["stk_cd"], []),
                                   "return_code": 0}, {"cont-yn": "N"})
-        if api == "ka90009":
-            return FakeResp(200, {"frgnr_orgn_trde_upper": self.frgn_inst_rows, "return_code": 0}, {"cont-yn": "N"})
         if api == "ka10080":
             return FakeResp(200, {"stk_cd": body["stk_cd"], "stk_min_pole_chart_qry": self.bars.get(body["stk_cd"], []),
                                   "return_code": 0}, {"cont-yn": "N", "next-key": ""})
@@ -134,6 +133,14 @@ class FakeKiwoom:
         self.daily.setdefault(sym, []).insert(0, {
             "dt": dt, "open_pric": f"+{o}", "high_pric": f"+{h}", "low_pric": f"+{l}",
             "cur_prc": f"+{c}", "trde_qty": str(v)})
+
+    def add_rank(self, sym: str, name: str, price: int, rate: float, qty: int, sources=("3", "1", "change")):
+        """순위 조회 응답에 종목 추가 (거래대금은 백만원 단위 — 키움과 같은 형식)"""
+        self.names[sym] = name
+        row = {"stk_cd": sym, "stk_nm": name, "cur_prc": f"+{price}", "flu_rt": f"{rate:+.2f}",
+               "trde_qty": str(qty), "now_trde_qty": str(qty), "trde_amt": str(price * qty // 1_000_000)}
+        for src in sources:
+            (self.change_top if src == "change" else self.today_top[src]).append(row)
 
     def api_calls(self, api: str) -> List[dict]:
         return [c for c in self.calls if c["api"] == api]

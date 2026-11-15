@@ -8,7 +8,9 @@ from python_app.engine.live_engine import EngineSettings, LiveTradingEngine
 from python_app.models.types import StrategyConfig, TradingMode
 from python_app.notify import telegram
 from python_app.notify.telegram import TelegramNotifier, mask_token
+from python_app.strategies.strategy_manager import StrategyManager
 from python_app.tests.fake_kiwoom import Clock, FakeKiwoom
+from python_app.tests.stubs import OpenCrossStub
 from python_app.tests.test_kiwoom_live import make_broker, seed_breakout_day
 
 
@@ -103,7 +105,7 @@ def _engine(tmp_path, fake, clock, **cfg):
     cap = CaptureNotifier()
     eng = LiveTradingEngine(make_broker(fake, TradingMode.MOCK, config), config, [("005930", "삼성전자")],
                             state_dir=str(tmp_path), clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
-                            notifier=cap)
+                            notifier=cap, manager=StrategyManager([OpenCrossStub()]))
     return eng, cap
 
 
@@ -161,7 +163,7 @@ def test_daily_pnl_saved_on_close(tmp_path):
     config = StrategyConfig()
     eng = LiveTradingEngine(make_broker(fake, TradingMode.MOCK, config), config, [("005930", "삼성전자")],
                             state_dir=str(tmp_path), clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
-                            db=db)
+                            db=db, manager=StrategyManager([OpenCrossStub()]))
     eng.start(); eng.tick()
     clock.set("09:06:20"); eng._last_sync = datetime.min; eng.tick()
     fake.prices["005930"] = 9898
@@ -193,7 +195,7 @@ def _db_engine(tmp_path, clock, fake):
     config = StrategyConfig()
     eng = LiveTradingEngine(make_broker(fake, TradingMode.MOCK, config), config, [("005930", "삼성전자")],
                             state_dir=str(tmp_path), clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
-                            db=db)
+                            db=db, manager=StrategyManager([OpenCrossStub()]))
     return eng, db
 
 

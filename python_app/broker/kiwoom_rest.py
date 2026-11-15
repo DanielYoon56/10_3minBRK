@@ -16,10 +16,10 @@ Korea3MinBreakoutTrader - 키움증권 REST API 브로커
   kt00001  /api/dostk/acnt      예수금상세 (ord_alow_amt = 주문가능금액, entr = 예수금)
   kt00018  /api/dostk/acnt      계좌평가잔고 (보유종목)
   ka10075  /api/dostk/acnt      미체결
-  ka10031  /api/dostk/rkinfo    전일거래량·거래대금 상위 100 (매집 스캔 후보)
-  ka10030  /api/dostk/rkinfo    당일거래량·거래대금 상위 (18시 매집 스캔 후보)
-  ka10081  /api/dostk/chart     주식일봉차트 (매집 ① 판정)
-  ka90009  /api/dostk/rkinfo    외국인·기관 매매 상위 (매집 ② 판정)
+  ka10030  /api/dostk/rkinfo    당일 거래량·거래대금 상위 (실시간 후보 탐색)
+  ka10027  /api/dostk/rkinfo    전일대비 등락률 상위 (실시간 후보 탐색)
+  ka10081  /api/dostk/chart     주식일봉차트
+  ka20001  /api/dostk/sect      업종현재가 (코스피 001 · 코스닥 101 지수 등락률)
 
 응답 규칙
   - HTTP 200이어도 body.return_code != 0 이면 업무 오류
@@ -106,6 +106,7 @@ class KiwoomRestBroker(BrokerBase):
         session: Optional[requests.Session] = None,
         min_interval: float = 0.25,
         base_url: str = "",
+        account_min_interval: float = 1.05,
     ):
         self.app_key = (app_key or "").strip()
         self.secret_key = (secret_key or "").strip()
@@ -115,6 +116,10 @@ class KiwoomRestBroker(BrokerBase):
         self.base_url = base_url or BASE_URLS[self.mode]
         self.session = session or requests.Session()
         self.min_interval = min_interval
+        # 계좌 TR(/api/dostk/acnt: kt00001·kt00018·ka10075) 유량제어 초당 1회 (2026-11-12 18시부터, 기존 초당 5회)
+        # 대상 TR 묶음 기준인지 TR별 기준인지 알 수 없어 계좌 TR 전체를 합쳐 1초에 1회로 제한한다
+        self.account_min_interval = account_min_interval
+        self._last_account_call = 0.0
 
         self.access_token: Optional[str] = None
         self.token_expiry: Optional[datetime] = None
@@ -129,11 +134,16 @@ class KiwoomRestBroker(BrokerBase):
         return self.mode == TradingMode.REAL
 
     # ================================================================ 통신 공통
-    def _throttle(self):
-        wait = self.min_interval - (time.monotonic() - self._last_call)
+    def _throttle(self, path: str = ""):
+        now = time.monotonic()
+        wait = self.min_interval - (now - self._last_call)
+        if path == self.ACCOUNT_PATH:
+            wait = max(wait, self.account_min_interval - (now - self._last_account_call))
         if wait > 0:
             time.sleep(wait)
         self._last_call = time.monotonic()
+        if path == self.ACCOUNT_PATH:
+            self._last_account_call = self._last_call
 
     def _post(
         self, path: str, api_id: str, body: Dict[str, Any],
@@ -153,7 +163,7 @@ class KiwoomRestBroker(BrokerBase):
             headers["next-key"] = cont_key
 
         with self._lock:
-            self._throttle()
+            self._throttle(path)
             resp = self.session.post(self.base_url + path, headers=headers, json=body, timeout=7)
 
         try:
@@ -301,31 +311,42 @@ class KiwoomRestBroker(BrokerBase):
             ))
         return bars
 
-    # ================================================================ 매집 스캔용 시세
-    def get_prev_day_top(self, qry_tp: str = "1", market: str = "000", top: int = 100) -> List[Dict[str, str]]:
-        """ka10031 전일 상위 100 (qry_tp 1=거래량, 2=거래대금 / market 000=전체, 001=코스피, 101=코스닥)"""
-        d, _ = self._post(self.RANK_PATH, "ka10031", {
-            "mrkt_tp": market, "qry_tp": qry_tp, "rank_strt": "0", "rank_end": str(top), "stex_tp": "1",
-        })
-        out = []
-        for it in d.get("pred_trde_qty_upper") or []:
-            code = _code(it.get("stk_cd", ""))
-            if code:
-                out.append({"symbol": code, "name": str(it.get("stk_nm", code)).strip()})
-        return out
+    # ================================================================ 순위 (실시간 후보 탐색)
+    @staticmethod
+    def _rank_row(it: Dict[str, Any], volume_key: str) -> Optional[Dict[str, Any]]:
+        code = _code(it.get("stk_cd", ""))
+        if not code:
+            return None
+        price = _price(it.get("cur_prc"))
+        volume = int(abs(_num(it.get(volume_key))))
+        amount = abs(_num(it.get("trde_amt"))) * 1_000_000      # 백만원 단위. 없는 TR 은 현재가 × 거래량으로 근사
+        return {"symbol": code, "name": str(it.get("stk_nm", code)).strip(), "price": price,
+                "change_rate": _num(it.get("flu_rt")), "volume": volume,
+                "trade_value": amount or price * volume}
 
-    def get_today_top(self, sort_tp: str = "1", market: str = "000", top: int = 100) -> List[Dict[str, str]]:
-        """ka10030 당일 거래 상위 (sort_tp 1=거래량, 3=거래대금) — 장 마감 후(18시) 매집 스캔 후보"""
+    def get_today_rank(self, sort_tp: str = "3", market: str = "000") -> List[Dict[str, Any]]:
+        """ka10030 당일 거래 상위 100 (sort_tp 1=거래량, 3=거래대금 / market 000=전체, 001=코스피, 101=코스닥)
+        → [{symbol, name, price, change_rate(%), volume, trade_value(원)}]"""
         d, _ = self._post(self.RANK_PATH, "ka10030", {
             "mrkt_tp": market, "sort_tp": sort_tp, "mang_stk_incls": "0", "crd_tp": "0", "trde_qty_tp": "0",
             "pric_tp": "0", "trde_prica_tp": "0", "mrkt_open_tp": "0", "stex_tp": "1",
         })
-        out = []
-        for it in (d.get("tdy_trde_qty_upper") or [])[:top]:
-            code = _code(it.get("stk_cd", ""))
-            if code:
-                out.append({"symbol": code, "name": str(it.get("stk_nm", code)).strip()})
-        return out
+        rows = (self._rank_row(it, "trde_qty") for it in d.get("tdy_trde_qty_upper") or [])
+        return [r for r in rows if r]
+
+    def get_change_rank(self, market: str = "000") -> List[Dict[str, Any]]:
+        """ka10027 전일대비 등락률 상위 (상승률순) → get_today_rank 와 같은 형식 (거래대금은 현재가 × 거래량 근사)"""
+        d, _ = self._post(self.RANK_PATH, "ka10027", {
+            "mrkt_tp": market, "sort_tp": "1", "trde_qty_cnd": "0000", "stk_cnd": "0", "crd_cnd": "0",
+            "updown_incls": "1", "pric_cnd": "0", "trde_prica_cnd": "0", "stex_tp": "1",
+        })
+        rows = (self._rank_row(it, "now_trde_qty") for it in d.get("pred_pre_flu_rt_upper") or [])
+        return [r for r in rows if r]
+
+    def get_index(self, market: str = "0", code: str = "001") -> Dict[str, float]:
+        """ka20001 업종현재가 → {price, change_rate(%)}. 코스피 = ("0", "001"), 코스닥 = ("1", "101")"""
+        d, _ = self._post("/api/dostk/sect", "ka20001", {"mrkt_tp": market, "inds_cd": code})
+        return {"price": _price(d.get("cur_prc")), "change_rate": _num(d.get("flu_rt"))}
 
     def get_stock_basic(self, symbol: str) -> Dict[str, Any]:
         """ka10001 → 현재가(장 전에는 전일 종가)·시가총액(원)"""
@@ -381,27 +402,6 @@ class KiwoomRestBroker(BrokerBase):
             "close": _price(r.get("cur_prc")),
             "volume": int(abs(_num(r.get("trde_qty")))),
         }
-
-    def get_foreign_inst_top(self, date: str, market: str = "000") -> Dict[str, List[Dict[str, Any]]]:
-        """ka90009 외국인·기관 매매 상위 (금액 기준, 단위: 천만원) → {"foreign": [...], "inst": [...]} 순매수 순위순"""
-        rows: List[Dict[str, Any]] = []
-        cont = ""
-        for _ in range(3):
-            d, h = self._post(self.RANK_PATH, "ka90009", {
-                "mrkt_tp": market, "amt_qty_tp": "1", "qry_dt_tp": "1", "date": date, "stex_tp": "1",
-            }, cont_key=cont)
-            rows.extend(d.get("frgnr_orgn_trde_upper") or [])
-            cont = h.get("next-key", "") if h.get("cont-yn") == "Y" else ""
-            if not cont:
-                break
-        out: Dict[str, List[Dict[str, Any]]] = {"foreign": [], "inst": []}
-        for r in rows:
-            for key, pre in (("foreign", "for_netprps"), ("inst", "orgn_netprps")):
-                code = _code(r.get(f"{pre}_stk_cd", ""))
-                if code:
-                    out[key].append({"symbol": code, "name": str(r.get(f"{pre}_stk_nm", code)).strip(),
-                                     "amount": abs(_num(r.get(f"{pre}_amt"))) * 10_000_000})
-        return out
 
     # ================================================================ 계좌
     def get_cash_balance(self) -> float:

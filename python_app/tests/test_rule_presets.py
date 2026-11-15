@@ -24,27 +24,44 @@ def test_load_config_keeps_old_files_working(tmp_path):
 def test_preset_survives_save_and_load(tmp_path):
     path = str(tmp_path / "config.json")
     cfg = _cfg()
-    save_rule_preset(cfg, "공격형", StrategyConfig(stop_loss_rate=3.5, entry_strategies=["orb_high", "smc_fvg"]))
+    save_rule_preset(cfg, "공격형", StrategyConfig(stop_loss_rate=3.5, max_daily_loss=123_000))
     save_config(cfg, path)
     loaded = rule_preset_config(load_config(path), "공격형")
     assert loaded.stop_loss_rate == 3.5
-    assert loaded.entry_strategies == ["orb_high", "smc_fvg"]
+    assert loaded.max_daily_loss == 123_000
 
 
 def test_preset_is_a_snapshot_not_a_live_reference():
     cfg, sc = _cfg(), StrategyConfig()
     save_rule_preset(cfg, "a", sc)
-    sc.entry_strategies.append("orb_high")
     sc.stop_loss_rate = 9.0
-    assert cfg["rule_presets"]["a"]["entry_strategies"] == ["open_breakout"]
     assert cfg["rule_presets"]["a"]["stop_loss_rate"] == 2.0
 
 
 def test_field_missing_from_old_preset_keeps_current_value():
-    cfg = _cfg(smc_min_risk_pct=0.7)
+    cfg = _cfg(take_profit_rate=0.7)
     cfg["rule_presets"]["옛날"] = {"stop_loss_rate": 1.5}
     target = rule_preset_config(cfg, "옛날")
-    assert (target.stop_loss_rate, target.smc_min_risk_pct) == (1.5, 0.7)
+    assert (target.stop_loss_rate, target.take_profit_rate) == (1.5, 0.7)
+
+
+def test_v6_config_drops_discarded_strategies_and_accumulation_scan(tmp_path):
+    """3WAYTRADING 전환: 기존 매수 전략(A~F)·매집 스캔 설정은 지우고 공통 설정은 그대로 둔다"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "config_version": 6, "stop_loss_rate": 1.5, "entry_strategies": ["open_breakout", "smc_fvg"],
+        "entry_logic": "AND", "trade_end_time": "10:00", "min_volume_ratio": 0.7, "smc_swing_len": 3,
+        "screener": {"enabled": True, "condition_name": "조건"},
+        "rule_presets": {"ST1": {"stop_loss_rate": 2.5, "entry_strategies": ["orb_high"], "vwap_touch_pct": 0.3}},
+    }), encoding="utf-8")
+    cfg = load_config(str(path))
+    assert cfg["config_version"] == 7 and cfg["stop_loss_rate"] == 1.5
+    assert not {"entry_strategies", "entry_logic", "trade_end_time", "min_volume_ratio", "smc_swing_len",
+                "screener"} & set(cfg)
+    assert cfg["rule_presets"]["ST1"] == {"stop_loss_rate": 2.5}
+    assert cfg["scanner"]["enabled"] is True
+    assert cfg["strategies"]["open"]["enabled"] is True and cfg["strategies"]["open"]["live_enabled"] is False
+    assert strategy_config_from(cfg).stop_loss_rate == 1.5
 
 
 def test_matching_preset():
@@ -57,8 +74,8 @@ def test_matching_preset():
 
 def test_copy_strategy_fields_overwrites_target():
     live = StrategyConfig()
-    copy_strategy_fields(StrategyConfig(max_daily_loss=1, smc_fvg_expiry_bars=25), live)
-    assert (live.max_daily_loss, live.smc_fvg_expiry_bars) == (1, 25)
+    copy_strategy_fields(StrategyConfig(max_daily_loss=1, take_profit_rate=2.5), live)
+    assert (live.max_daily_loss, live.take_profit_rate) == (1, 2.5)
 
 
 # ------------------------------------------------------------------ GUI
@@ -72,7 +89,7 @@ def window(tmp_path, monkeypatch):
 
     app = QApplication.instance() or QApplication([])
     path = str(tmp_path / "config.json")
-    save_config({"stop_loss_rate": 2.0, "smc_fvg_expiry_bars": 10}, path)
+    save_config({"stop_loss_rate": 2.0}, path)
     monkeypatch.setattr(app_main, "APP_DIR", str(tmp_path))
     monkeypatch.setattr(app_main, "load_config", lambda: load_config(path))
     monkeypatch.setattr(app_main, "save_config", lambda cfg: save_config(cfg, path))
@@ -116,48 +133,24 @@ def test_apply_restores_every_field_in_place(window, monkeypatch):
     _answer(window, monkeypatch, _yes(window))
     live = window.config
     window.spn_sl.setValue(3.3)
-    window.chk_strats["smc_fvg"].setChecked(True)
-    window.cmb_logic.setCurrentIndex(1)
-    live.smc_fvg_expiry_bars = 25            # 화면에 없는 세부값
+    window.chk_eod.setChecked(False)
+    live.take_profit_rate = 2.5              # 화면에 없는 세부값
     _save_as(window, monkeypatch, "공격형")
     assert window.lbl_preset.text() == "현재 값 = '공격형'"
 
     window.spn_sl.setValue(1.1)
-    window.chk_strats["smc_fvg"].setChecked(False)
-    window.cmb_logic.setCurrentIndex(0)
-    live.smc_fvg_expiry_bars = 10
+    window.chk_eod.setChecked(True)
+    live.take_profit_rate = 0.0
     window.on_settings_changed()
     assert window.lbl_preset.text() == "현재 값: 저장 안 됨"
 
     window.apply_preset()
     assert window.config is live
     assert live.stop_loss_rate == 3.3 and window.spn_sl.value() == 3.3
-    assert live.entry_strategies == ["open_breakout", "smc_fvg"] and live.entry_logic == "AND"
-    assert live.smc_fvg_expiry_bars == 25
+    assert live.eod_liquidation is False and not window.chk_eod.isChecked()
+    assert live.take_profit_rate == 2.5
     assert window.lbl_preset.text() == "현재 값 = '공격형'"
     assert strategy_config_from(load_config(window.saved_path)) == live
-
-
-def test_applying_pushes_one_complete_config_to_running_engine(window, monkeypatch):
-    _answer(window, monkeypatch, _yes(window))
-    window.spn_sl.setValue(3.3)
-    window.spn_amount.setValue(2_000_000)
-    _save_as(window, monkeypatch, "a")
-    window.spn_sl.setValue(1.1)
-    window.spn_amount.setValue(500_000)
-    _save_as(window, monkeypatch, "b")
-
-    seen = []
-
-    class Strategy:
-        def update_config(self, c):
-            seen.append((c.stop_loss_rate, c.order_amount_per_trade))
-
-    window.engine = type("Engine", (), {"strategy": Strategy()})()
-    window.cmb_preset.setCurrentText("a")
-    window.apply_preset()
-    window.engine = None
-    assert seen == [(3.3, 2_000_000)]
 
 
 def test_selecting_in_combo_alone_changes_nothing(window, monkeypatch):
@@ -216,20 +209,6 @@ def test_real_running_confirmation_shows_target_rules(window, monkeypatch):
     assert window.config.order_amount_per_trade == 1_000_000
 
 
-def test_running_warns_when_preset_turns_on_a_new_strategy(window, monkeypatch):
-    _answer(window, monkeypatch, _yes(window))
-    window.chk_strats["orb_high"].setChecked(True)
-    _save_as(window, monkeypatch, "B포함")
-    window.chk_strats["orb_high"].setChecked(False)
-    _save_as(window, monkeypatch, "A만")
-    window.cmb_preset.setCurrentText("B포함")
-    window.worker = _Running()
-    calls = _answer(window, monkeypatch, _no(window))
-    window.apply_preset()
-    window.worker = None
-    assert "새로 켜는 매수 전략" in calls[0]
-
-
 def test_overwrite_declined_and_delete(window, monkeypatch):
     _answer(window, monkeypatch, _yes(window))
     window.spn_sl.setValue(3.3)
@@ -245,42 +224,31 @@ def test_overwrite_declined_and_delete(window, monkeypatch):
     assert not window.btn_preset_apply.isEnabled()
 
 
-def test_condition_list_load_gives_visible_feedback(window, monkeypatch):
-    class FakeClient:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            pass
-
-        def list_conditions(self):
-            return [("0", "기존조건"), ("1", "새조건")]
-
-    monkeypatch.setattr(window.main_module, "KiwoomConditionClient", FakeClient)
-    monkeypatch.setattr(window, "_temp_broker", lambda: object())
-    window.cmb_cond.setCurrentText("기존조건")
-    window.show()
-    window.load_condition_list()
-    popup_shown = window.cmb_cond.view().isVisible()
-    window.cmb_cond.hidePopup()
-
-    assert popup_shown
-    assert window.cmb_cond.currentText() == "기존조건"
-    assert window.cmb_cond.count() == 2
-    assert "2개" in window.statusBar.currentMessage()
+def test_scanner_settings_are_saved_from_settings_tab(window):
+    window.scan_max.setValue(25)
+    window.scan_value.setValue(80)          # 억
+    saved = load_config(window.saved_path)["scanner"]
+    assert saved["max_candidates"] == 25 and saved["min_trade_value"] == 8_000_000_000
 
 
-def test_scan_progress_shows_count_and_time_left(window):
-    window._scan_started = window.main_module.time.monotonic() - 100
-    window.on_scan_progress(100, 400)
-    assert window.btn_scan.text() == "스캔 중… 100/400 (약 5분 남음)"
-    window.on_scan_progress(0, 400)
-    assert window.btn_scan.text() == "스캔 중… 0/400"
+def test_rule_summary_lists_strategies_and_flags_unapproved_ones_in_real_mode(window):
+    assert "OPEN 09:06~09:45" in window._rule_summary(window.config)
+    window.mode = TradingMode.REAL
+    summary = window._rule_summary(window.config)
+    window.mode = TradingMode.MOCK
+    assert "활성 전략 없음" in summary and "실거래 미승인" in summary
 
 
-def test_scan_warning_reaches_log_tab(window):
-    window._make_screener(object()).log("warning", "조건식 결과 682종목 → 상위 400개만 검사")
-    assert "상위 400개만 검사" in window.txt_log.toPlainText()
+def test_strategy_switches_are_saved_and_pushed_to_running_engine(window):
+    from python_app.strategies.strategy_manager import build_manager
+    chk, te_start, te_end, patterns = window.strategy_inputs["open"]
+    manager = build_manager(window.cfg)
+    window.engine = type("Engine", (), {"manager": manager, "scanner": None})()
+    patterns["momentum"].setChecked(False)
+    te_end.setTime(window.main_module.QTime(10, 30))
+    chk.setChecked(False)
+    window.engine = None
+    saved = load_config(window.saved_path)["strategies"]["open"]
+    assert (saved["enabled"], saved["end_time"], saved["use_momentum"], saved["use_orb"]) == (False, "10:30", False, True)
+    live = manager.strategy("open")
+    assert not live.enabled and live.settings.end_time == "10:30" and not live.settings.use_momentum

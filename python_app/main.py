@@ -1,8 +1,9 @@
 """
-Korea3MinBreakoutTrader - Windows 데스크톱 자동매매 (PySide6 + 키움증권 REST API)
+3WAYTRADING - Windows 데스크톱 자동매매 (PySide6 + 키움증권 REST API)
 
-매수: 첫 3분봉 시가 상향 돌파 + 돌파 봉 거래량 > 첫 봉 거래량의 70%
-매도: 손절 -2% / 트레일링 스탑 (+1% 이상 상승 후 상승분 되돌림: 최고가 1R 미만 50%, 1R 이상 30%)
+감시종목: 당일 거래대금·거래량·등락률 순위로 장중에 계속 찾는다 (실시간 후보 탐색)
+매수: OPEN / INTRADAY / CLOSE 세 전략이 각자 3분봉으로 판정 (strategies/)
+매도: 포지션을 소유한 전략의 청산 규칙 (기본: 손절 / 트레일링 스탑 / 목표가)
 
 [모의거래] 키움 모의투자 서버(mockapi.kiwoom.com) — 모의투자용 앱키
 [실거래]   키움 실서버(api.kiwoom.com)            — 실거래용 앱키, 전환·시작 시 이중 확인
@@ -12,7 +13,6 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 import logging
 from datetime import datetime, time as dtime
 from typing import List, Optional
@@ -37,13 +37,14 @@ from python_app.app_config import (
 )
 from python_app.chart_dialog import BUY_COLOR, PROFIT_COLOR, STOP_COLOR, ChartDialog, PriceLevel
 from python_app.notify.telegram import TelegramNotifier
-from python_app.broker.kiwoom_condition import KiwoomConditionClient
-from python_app.screener.accumulation import AccumulationScreener, ScreenerConfig, latest_cached
+from python_app.risk.capital_guard import CapitalGuard, RiskConfig
+from python_app.backtest.bar_store import BarStore
 from python_app.broker.kiwoom_rest import KiwoomRestBroker
 from python_app.db.storage import DatabaseManager
 from python_app.engine.live_engine import FEE_RATE, TAX_RATE, LiveTradingEngine, kst_now
 from python_app.models.types import TradingMode
-from python_app.strategy.combiner import STRATEGY_KEYS, STRATEGY_LABELS
+from python_app.strategies.candidate_scanner import CandidateScanner, ScannerConfig
+from python_app.strategies.strategy_manager import STRATEGY_CLASSES, build_manager
 from python_app.strategy.exit_rules import trailing_stop_price
 
 LOG_DIR = os.path.join(APP_DIR, "logs")
@@ -204,23 +205,6 @@ class EngineWorker(QThread):
         self.wait(5000)
 
 
-class ScanWorker(QThread):
-    """자동매매 시작 전 [지금 스캔] 미리보기용"""
-    done = PySignal(object, str)   # ScreenResult or None, error
-    progress = PySignal(int, int)  # 검사 완료 수, 전체
-
-    def __init__(self, screener, now):
-        super().__init__()
-        self.screener, self.now = screener, now
-        screener.progress = self.progress.emit
-
-    def run(self):
-        try:
-            self.done.emit(self.screener.run(self.now, use_cache=False), "")
-        except Exception as e:
-            self.done.emit(None, str(e))
-
-
 def _scrollable(widget: QWidget) -> QScrollArea:
     area = QScrollArea()
     area.setWidgetResizable(True)
@@ -238,12 +222,9 @@ def _item(text, align=Qt.AlignCenter, color: str = ""):
 
 
 class MainWindow(QMainWindow):
-    scan_log = PySignal(str, str)   # level, message — 스캔 스레드에서도 실행 로그 탭에 안전하게 표시
-
     def __init__(self, autostart: bool = False):
         super().__init__()
-        self.scan_log.connect(self.append_log)
-        self.setWindowTitle("Korea3MinBreakoutTrader — 3분봉 시가돌파 자동매매 [키움증권]")
+        self.setWindowTitle("3WAYTRADING — OPEN · INTRADAY · CLOSE 자동매매 [키움증권]")
         self.autostart = autostart
         self._force_close = False
         self._start_retries = 0
@@ -282,7 +263,7 @@ class MainWindow(QMainWindow):
 
         # --- 헤더: 제목 / 시계 / 모의·실거래 전환 / 시작·중지
         header = QHBoxLayout()
-        title = QLabel("KRX 3분봉 시가돌파 자동매매")
+        title = QLabel("3WAYTRADING 자동매매")
         title.setFont(QFont("Malgun Gothic", 14, QFont.Bold))
         title.setStyleSheet("color: #58a6ff;")
         header.addWidget(title)
@@ -317,6 +298,12 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_trading)
         header.addWidget(self.btn_stop)
+        self.btn_halt = QPushButton("신규 매수 중단")
+        self.btn_halt.setCheckable(True)
+        self.btn_halt.setEnabled(False)
+        self.btn_halt.setToolTip("비상 정지: 신규 매수만 막습니다. 보유 종목의 손절·청산 감시는 계속됩니다.")
+        self.btn_halt.clicked.connect(self.toggle_halt)
+        header.addWidget(self.btn_halt)
         root.addLayout(header)
 
         # --- 모드 배너
@@ -343,7 +330,7 @@ class MainWindow(QMainWindow):
         self.wl_box = wl_box = QGroupBox("감시 종목")
         wl = QVBoxLayout(wl_box)
         self.table_watch = QTableWidget(0, 7)
-        self.table_watch.setHorizontalHeaderLabels(["종목코드", "종목명", "매집 근거", "현재가", "돌파기준", "기준거래량", "상태"])
+        self.table_watch.setHorizontalHeaderLabels(["종목코드", "종목명", "순위", "현재가", "등락률", "거래대금", "상태"])
         self.table_watch.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_watch.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table_watch.verticalHeader().setVisible(False)
@@ -492,9 +479,6 @@ class MainWindow(QMainWindow):
             return s
 
         c = self.config
-        self.te_start = tedit(c.trade_start_time)
-        self.te_end = tedit(c.trade_end_time)
-        self.spn_vol = dspin(0.1, 10.0, 0.1, c.min_volume_ratio, 2)
         self.spn_sl = dspin(0.5, 10.0, 0.1, c.stop_loss_rate)
         self.spn_trail = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate)
         self.spn_trail_1r = dspin(0.0, 90.0, 1.0, c.trailing_retrace_rate_1r)
@@ -512,11 +496,10 @@ class MainWindow(QMainWindow):
         self.chk_no_reentry.setChecked(not c.allow_reentry_same_day)
 
         rows = [
-            ("신규 진입 시작", self.te_start, "신규 진입 마감", self.te_end),
-            ("돌파 봉 최소 거래량 (첫 봉 대비, 0.7 = 70%)", self.spn_vol, "손절 (%)", self.spn_sl),
+            ("손절 (%, 전략이 손절가를 주지 않았을 때)", self.spn_sl,
+             "트레일링 스탑 발동 상승률 (%, 진입 후 최고가 기준)", self.spn_trail_act),
             ("트레일링 되돌림: 최고가 1R 미만 (상승분의 %)", self.spn_trail,
              "트레일링 되돌림: 최고가 1R 이상 (%, 0 = 구분 없음)", self.spn_trail_1r),
-            ("트레일링 스탑 발동 상승률 (%, 진입 후 최고가 기준)", self.spn_trail_act, "", None),
             ("1회 매수 금액 (원)", self.spn_amount, "최대 동시 보유 종목", self.spn_maxpos),
             ("일 손실한도 (원, 도달 시 신규 매수 중단)", self.spn_maxloss, "일괄 청산 시각 (15:20 동시호가 전 권장)", self.te_eod),
         ]
@@ -525,27 +508,26 @@ class MainWindow(QMainWindow):
             if w2 is not None:
                 g.addWidget(QLabel(l2), r, 2); g.addWidget(w2, r, 3)
 
-        for wdg in (self.spn_vol, self.spn_sl, self.spn_trail, self.spn_trail_1r, self.spn_trail_act):
+        for wdg in (self.spn_sl, self.spn_trail, self.spn_trail_1r, self.spn_trail_act):
             wdg.valueChanged.connect(self.on_settings_changed)
         for wdg in (self.spn_amount, self.spn_maxpos, self.spn_maxloss):
             wdg.valueChanged.connect(self.on_settings_changed)
         g.addWidget(self.chk_eod, len(rows), 0, 1, 2)
         g.addWidget(self.chk_carry, len(rows), 2, 1, 2)
         g.addWidget(self.chk_no_reentry, len(rows) + 1, 0, 1, 2)
-        for wdg in (self.te_start, self.te_end, self.te_eod):
-            wdg.timeChanged.connect(self.on_settings_changed)
+        self.te_eod.timeChanged.connect(self.on_settings_changed)
         for wdg in (self.chk_eod, self.chk_carry, self.chk_no_reentry):
             wdg.toggled.connect(self.on_settings_changed)
         lay.addWidget(box)
 
-        lay.addWidget(self._build_entry_box(tedit, dspin))
-        lay.addWidget(self._build_screener_box())
+        lay.addWidget(self._build_strategies_box(tedit))
+        lay.addWidget(self._build_scanner_box())
 
         info = QLabel(
-            "★ 감시종목: 키움 조건식 결과 중 전일 매집(① 거래량 급증·양봉·고가 근처 마감  또는  ② 외국인·기관 동시 순매수 상위) 종목\n"
-            "★ 매수: 위 '매수 전략'에서 선택한 전략을 OR(하나라도) / AND(당일 모두 충족) 로 조합 — 시장가 진입 (SMC 만 FVG 중간값 지정가)\n"
-            "★ 매도: ① 매입가 대비 손절  ② 발동 상승률 이상 오른 뒤 상승분을 되돌리면 전량 시장가 청산 (1R = 매입가 - 손절가, 최고가 기준으로 구간 판정)  ③ 장 마감 전 일괄 청산\n"
-            "   (SMC 진입분: 손절가만 전략 값, 나머지는 공통 적용)\n"
+            "★ 감시종목: 당일 거래대금·거래량·등락률 상위에서 장중에 계속 찾습니다 (3분마다 교체, 순위는 매수 우선순위에만 사용)\n"
+            "★ 매수: OPEN · INTRADAY · CLOSE 전략이 각자 완성된 3분봉으로 판정 — 구현된 전략만 신호를 냅니다 "
+            f"(구현됨: {', '.join(cls.label for cls in STRATEGY_CLASSES.values()) or '없음'})\n"
+            "★ 매도: ① 손절(전략 손절가, 없으면 매입가 대비 %)  ② 발동 상승률 이상 오른 뒤 상승분을 되돌리면 전량 시장가 청산  ③ 장 마감 전 일괄 청산\n"
             "★ 주의: 감시·매도는 이 앱이 켜져 있을 때만 작동합니다 (PC 절전·종료 시 중단)\n"
             "★ 안전: 앱이 매수한 종목만 청산 · 늦게 시작하면 지나간 신호는 매수 안 함 · 일 손실한도 도달 시 신규 매수 중단")
         info.setStyleSheet("color: #8b949e;")
@@ -554,7 +536,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_preset_box(self) -> QWidget:
-        box = QGroupBox("저장된 매매 규칙 (아래 매매 규칙 파라미터 + 매수 전략을 이름 붙여 보관)")
+        box = QGroupBox("저장된 매매 규칙 (아래 매매 규칙 파라미터를 이름 붙여 보관)")
         row = QHBoxLayout(box)
         self.cmb_preset = QComboBox()
         self.cmb_preset.setMinimumWidth(220)
@@ -575,143 +557,119 @@ class MainWindow(QMainWindow):
         self._reload_presets()
         return box
 
-    def _build_entry_box(self, tedit, dspin) -> QWidget:
-        c = self.config
-        box = QGroupBox("매수 전략 (복수 선택 + 조합, 변경 즉시 적용·저장)")
+    def _build_strategies_box(self, tedit) -> QWidget:
+        box = QGroupBox("전략 — 각자 독립 판정 (변경 즉시 적용·저장)")
         g = QGridLayout(box)
-        self.chk_strats = {}
-        hints = {
-            "open_breakout": "첫 3분봉 시가 상향 돌파 + 거래량",
-            "orb_high": "첫 3분봉 고가 상향 돌파 + 거래량 (갭상승 종목)",
-            "vwap_pullback": "VWAP 위 추세 → VWAP 근처 눌림 후 양봉 반등",
-            "prev_high": "전일 일봉 고가 상향 돌파 + 거래량",
-            "day_swing_high": "당일 스윙 고점 상향 돌파 + 거래량, 자체 손절",
-            "smc_fvg": "하락 구조 → CHoCH → 첫 FVG 중간값 지정가",
-        }
-        for i, key in enumerate(STRATEGY_KEYS):
-            chk = QCheckBox(STRATEGY_LABELS[key])
-            chk.setChecked(key in c.entry_strategies)
-            chk.setToolTip(hints[key])
-            chk.toggled.connect(self.on_settings_changed)
-            self.chk_strats[key] = chk
-            g.addWidget(chk, i // 3, i % 3)
-        self.cmb_logic = QComboBox()
-        self.cmb_logic.addItems(["OR — 하나라도 신호 시 진입", "AND — 선택 전략 모두 당일 신호 시 진입"])
-        self.cmb_logic.setCurrentIndex(1 if str(c.entry_logic).upper() == "AND" else 0)
-        self.cmb_logic.currentIndexChanged.connect(self.on_settings_changed)
-        g.addWidget(QLabel("조합"), 2, 0)
-        g.addWidget(self.cmb_logic, 2, 1)
-
-        self.cmb_stop_mode = QComboBox()
-        self.cmb_stop_mode.addItems(["보호 저점(CHoCH 레그 최저가) 아래", "FVG 하단 아래"])
-        self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
-        g.addWidget(QLabel("F. SMC 손절 기준"), 3, 0)
-        g.addWidget(self.cmb_stop_mode, 3, 1)
-        self.cmb_stop_mode.currentIndexChanged.connect(self.on_settings_changed)
-        note = QLabel("진입 시간대는 위 '매매 규칙 파라미터'의 '신규 진입 시작~마감'을 씁니다 "
-                      "(단, C·F 의 신규 진입 마감은 14:00 고정). "
-                      "손절·트레일링은 A~F 모두 위 '매매 규칙 파라미터' 값을 씁니다 (F 의 손절가만 전략 기준). "
-                      "AND 는 신호가 크게 줄어듭니다. 세부값(눌림 폭·손절폭 범위·지정가 유효 봉 수)은 config.json")
+        self.strategy_inputs = {}
+        row = 0
+        for name, cls in STRATEGY_CLASSES.items():
+            block = self.cfg["strategies"][name]
+            chk = QCheckBox(f"{cls.label} 사용")
+            chk.setChecked(bool(block["enabled"]))
+            te_start, te_end = tedit(block["start_time"]), tedit(block["end_time"])
+            g.addWidget(chk, row, 0)
+            g.addWidget(QLabel("신규 진입 시작"), row, 1); g.addWidget(te_start, row, 2)
+            g.addWidget(QLabel("마감"), row, 3); g.addWidget(te_end, row, 4)
+            patterns = {}
+            for col, (pattern, label) in enumerate(cls.pattern_labels.items()):
+                if f"use_{pattern}" not in block:
+                    continue
+                pc = QCheckBox(label)
+                pc.setChecked(bool(block[f"use_{pattern}"]))
+                pc.toggled.connect(self.save_strategies)
+                g.addWidget(pc, row + 1, col + (1 if col else 0), 1, 1 if col else 2)
+                patterns[pattern] = pc
+            chk.toggled.connect(self.save_strategies)
+            te_start.timeChanged.connect(self.save_strategies)
+            te_end.timeChanged.connect(self.save_strategies)
+            self.strategy_inputs[name] = (chk, te_start, te_end, patterns)
+            row += 2
+        note = QLabel("실거래에서는 config.json 의 strategies.<전략>.live_enabled 를 true 로 바꾼 전략만 신규 진입합니다 "
+                      "(검증 전 전략의 실주문 방지 — 모의거래는 '사용'만 켜면 됩니다). "
+                      "진입 조건의 세부값도 config.json 의 strategies 에 있으며 기본값은 검증 전 임시값입니다.")
         note.setStyleSheet("color: #8b949e;")
         note.setWordWrap(True)
-        g.addWidget(note, 4, 0, 1, 4)
+        g.addWidget(note, row, 0, 1, 5)
         return box
 
-    def _build_screener_box(self) -> QWidget:
-        sc = self.cfg["screener"]
-        box = QGroupBox("감시종목 자동 선정 — 키움 조건식 AND 전일 매집 (① 거래량·캔들  또는  ② 외국인·기관 동시 순매수)")
+    def save_strategies(self, *_):
+        for name, (chk, te_start, te_end, patterns) in self.strategy_inputs.items():
+            block = self.cfg["strategies"][name]
+            block["enabled"] = chk.isChecked()
+            block["start_time"] = te_start.time().toString("HH:mm")
+            block["end_time"] = te_end.time().toString("HH:mm")
+            for pattern, pc in patterns.items():
+                block[f"use_{pattern}"] = pc.isChecked()
+            strat = self.engine.manager.strategy(name) if self.engine else None
+            if strat:
+                strat.update_settings(STRATEGY_CLASSES[name].settings_class.from_dict(block))
+        save_config(self.cfg)
+
+    def _strategy_summary(self) -> str:
+        manager = build_manager(self.cfg)
+        manager.live = self.mode == TradingMode.REAL
+        return manager.describe()
+
+    def _build_scanner_box(self) -> QWidget:
+        sc = self.cfg["scanner"]
+        box = QGroupBox("감시종목 — 실시간 후보 탐색 (당일 거래대금·거래량·등락률 상위, 변경 즉시 저장)")
         g = QGridLayout(box)
 
-        self.chk_scr = QCheckBox("매일 장 전(08:00~) 자동 선정 사용  (끄면 설정 파일의 고정 종목 감시)")
-        self.chk_scr.setChecked(bool(sc.get("enabled", True)))
-        g.addWidget(self.chk_scr, 0, 0, 1, 4)
+        self.chk_scan = QCheckBox("실시간 후보 탐색 사용  (끄면 설정 파일의 고정 종목 감시 — 다음 시작부터 적용)")
+        self.chk_scan.setChecked(bool(sc.get("enabled", True)))
+        g.addWidget(self.chk_scan, 0, 0, 1, 4)
 
-        self.cmb_cond = QComboBox()
-        self.cmb_cond.setEditable(True)
-        self.cmb_cond.setMinimumWidth(220)
-        if sc.get("condition_name"):
-            self.cmb_cond.addItem(sc["condition_name"])
-        self.cmb_cond.setCurrentText(sc.get("condition_name", ""))
-        self.cmb_cond.lineEdit().setPlaceholderText("영웅문에서 '서버 저장'한 조건식 이름")
-        btn_list = QPushButton("조건식 목록 불러오기")
-        btn_list.clicked.connect(self.load_condition_list)
-        g.addWidget(QLabel("키움 조건식"), 1, 0); g.addWidget(self.cmb_cond, 1, 1, 1, 2); g.addWidget(btn_list, 1, 3)
-
-        def dspin(lo, hi, step, val, dec=1, suffix=""):
-            w = QDoubleSpinBox(); w.setRange(lo, hi); w.setSingleStep(step); w.setDecimals(dec); w.setValue(val)
-            if suffix:
-                w.setSuffix(suffix)
+        def dspin(lo, hi, step, val, suffix=""):
+            w = QDoubleSpinBox(); w.setRange(lo, hi); w.setSingleStep(step); w.setDecimals(1); w.setValue(val)
+            w.setSuffix(suffix)
             return w
 
         def ispin(lo, hi, step, val, suffix=""):
             w = QSpinBox(); w.setRange(lo, hi); w.setSingleStep(step); w.setValue(int(val)); w.setGroupSeparatorShown(True)
-            if suffix:
-                w.setSuffix(suffix)
+            w.setSuffix(suffix)
             return w
 
-        self.scr_vol = dspin(1.0, 20.0, 0.5, sc["vol_surge_ratio"], 1, " 배")
-        self.scr_wick = dspin(0, 100, 5, sc["upper_wick_max"] * 100, 0, " %")
-        self.scr_value = ispin(0, 100_000, 10, sc["min_trade_value"] / 1e8, " 억")
-        self.scr_top = ispin(1, 100, 5, sc["net_buy_top"], " 위")
-        self.scr_netbuy = ispin(0, 100_000, 5, sc["min_net_buy_amount"] / 1e8, " 억")
-        self.scr_max = ispin(1, 100, 5, sc["max_watch"], " 종목")
-        self.scr_price = ispin(0, 1_000_000, 500, sc["min_price"], " 원")
-        self.scr_mcap = ispin(0, 1_000_000, 500, sc["min_market_cap"] / 1e8, " 억")
+        self.scan_max = ispin(1, 100, 5, sc["max_candidates"], " 종목")
+        self.scan_value = ispin(0, 100_000, 10, sc["min_trade_value"] / 1e8, " 억")
+        self.scan_price = ispin(0, 1_000_000, 500, sc["min_price"], " 원")
+        self.scan_chg_min = dspin(-30.0, 30.0, 0.5, sc["min_change_rate"], " %")
+        self.scan_chg_max = dspin(-30.0, 30.0, 0.5, sc["max_change_rate"], " %")
+        self.scan_every = ispin(1, 20, 1, sc["refresh_every_bars"], " 봉마다")
         rows = [
-            ("① 전일 거래량 ≥ 20일 평균 ×", self.scr_vol, "① 윗꼬리 ≤ (당일 범위 대비)", self.scr_wick),
-            ("① 전일 거래대금 ≥", self.scr_value, "② 외국인·기관 각각 순매수 상위", self.scr_top),
-            ("② 순매수 금액 ≥", self.scr_netbuy, "최대 감시 종목 수", self.scr_max),
-            ("주가 ≥ (조건식 미사용 시만)", self.scr_price, "시가총액 ≥ (조건식 미사용 시만)", self.scr_mcap),
+            ("최대 후보 수 (3분마다 봉 조회)", self.scan_max, "순위 재조회 주기", self.scan_every),
+            ("당일 누적 거래대금 ≥", self.scan_value, "주가 ≥", self.scan_price),
+            ("등락률 ≥", self.scan_chg_min, "등락률 ≤ (상한가 근처 제외)", self.scan_chg_max),
         ]
-        for r, (l1, w1, l2, w2) in enumerate(rows, start=2):
+        for r, (l1, w1, l2, w2) in enumerate(rows, start=1):
             g.addWidget(QLabel(l1), r, 0); g.addWidget(w1, r, 1); g.addWidget(QLabel(l2), r, 2); g.addWidget(w2, r, 3)
+        note = QLabel("ETF·ETN·스팩·우선주는 제외합니다. 후보 수가 많을수록 3분봉 조회가 늦어집니다 (종목당 약 0.25초). "
+                      "순위 가중치 등 세부값은 config.json 의 scanner")
+        note.setStyleSheet("color: #8b949e;")
+        note.setWordWrap(True)
+        g.addWidget(note, len(rows) + 1, 0, 1, 4)
 
-        self.btn_scan = QPushButton("지금 스캔 (결과 미리보기)")
-        self.btn_scan.clicked.connect(self.scan_now)
-        g.addWidget(self.btn_scan, len(rows) + 2, 3)
-
-        for w in (self.scr_vol, self.scr_wick, self.scr_value, self.scr_top, self.scr_netbuy, self.scr_max,
-                  self.scr_price, self.scr_mcap):
-            w.valueChanged.connect(self.save_screener)
-        self.chk_scr.toggled.connect(self.save_screener)
-        self.cmb_cond.currentTextChanged.connect(self.save_screener)
-        self._sync_screener_enabled()
+        for w in (self.scan_max, self.scan_value, self.scan_price, self.scan_chg_min, self.scan_chg_max,
+                  self.scan_every):
+            w.valueChanged.connect(self.save_scanner)
+        self.chk_scan.toggled.connect(self.save_scanner)
         return box
 
-    # ================================================================ 감시종목 선정
-    def _screener_cfg(self) -> ScreenerConfig:
-        return ScreenerConfig.from_dict(self.cfg["screener"])
-
-    def _sync_screener_enabled(self):
-        use_cond = bool(self.cmb_cond.currentText().strip())
-        for w in (self.scr_price, self.scr_mcap):
-            w.setEnabled(not use_cond)
-
-    def save_screener(self, *_):
-        sc = self.cfg["screener"]
-        sc.update({
-            "enabled": self.chk_scr.isChecked(),
-            "condition_name": self.cmb_cond.currentText().strip(),
-            "vol_surge_ratio": self.scr_vol.value(),
-            "upper_wick_max": round(self.scr_wick.value() / 100, 3),
-            "min_trade_value": int(self.scr_value.value() * 1e8),
-            "net_buy_top": self.scr_top.value(),
-            "min_net_buy_amount": int(self.scr_netbuy.value() * 1e8),
-            "max_watch": self.scr_max.value(),
-            "min_price": self.scr_price.value(),
-            "min_market_cap": int(self.scr_mcap.value() * 1e8),
+    # ================================================================ 감시종목
+    def save_scanner(self, *_):
+        self.cfg["scanner"].update({
+            "enabled": self.chk_scan.isChecked(),
+            "max_candidates": self.scan_max.value(),
+            "refresh_every_bars": self.scan_every.value(),
+            "min_trade_value": int(self.scan_value.value() * 1e8),
+            "min_price": self.scan_price.value(),
+            "min_change_rate": self.scan_chg_min.value(),
+            "max_change_rate": self.scan_chg_max.value(),
         })
         save_config(self.cfg)
-        self._sync_screener_enabled()
-        if self.engine and self.engine.screener:
-            self.engine.screener.cfg = self._screener_cfg()
+        if self.engine and self.engine.scanner:
+            self.engine.scanner.cfg = ScannerConfig.from_dict(self.cfg["scanner"])
         if not self.engine:
             self._fill_watch_preview()
-
-    def _make_screener(self, broker) -> AccumulationScreener:
-        return AccumulationScreener(
-            broker, self._screener_cfg(), state_dir=APP_DIR, log=self.scan_log.emit,
-            condition_client_factory=lambda: KiwoomConditionClient(broker, raw_log_dir=LOG_DIR))
 
     def _temp_broker(self):
         self._keys_from_inputs()
@@ -721,104 +679,19 @@ class MainWindow(QMainWindow):
             return None
         return KiwoomRestBroker(app_key, secret, mode=self.mode, config=self.config)
 
-    def load_condition_list(self):
-        broker = self._temp_broker()
-        if not broker:
-            return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            with KiwoomConditionClient(broker, raw_log_dir=LOG_DIR) as cc:
-                conds = cc.list_conditions()
-            err = ""
-        except Exception as e:
-            conds, err = [], str(e)
-        finally:
-            QApplication.restoreOverrideCursor()
-        if err:
-            QMessageBox.critical(self, "조건식 목록", f"불러오기 실패:\n{err}")
-            return
-        if not conds:
-            QMessageBox.information(self, "조건식 목록",
-                                    "저장된 조건식이 없습니다.\n영웅문 [0150] 조건검색에서 조건식을 만들고 '서버 저장' 하세요.")
-            return
-        cur = self.cmb_cond.currentText()
-        self.cmb_cond.blockSignals(True)
-        self.cmb_cond.clear()
-        self.cmb_cond.addItems([nm for _, nm in conds])
-        self.cmb_cond.setCurrentText(cur if cur in [nm for _, nm in conds] else conds[0][1])
-        self.cmb_cond.blockSignals(False)
-        self.save_screener()
-        self.append_log("info", f"조건식 {len(conds)}개: {', '.join(nm for _, nm in conds)}")
-        # 현재 선택값이 그대로면 화면 변화가 없어 실패로 보이므로 결과를 바로 보여 준다
-        self.statusBar.showMessage(f"조건식 {len(conds)}개를 불러왔습니다", 5000)
-        self.cmb_cond.showPopup()
-
-    def scan_now(self):
-        if self.engine and self.worker and self.worker.isRunning():
-            if self.engine.request_rescan():
-                self.append_log("info", "감시종목 다시 스캔 요청")
-            else:
-                self.append_log("info", "이미 스캔 중이거나 자동 선정이 꺼져 있습니다")
-            return
-        broker = self._temp_broker()
-        if not broker:
-            return
-        if not broker.connect():
-            QMessageBox.critical(self, "스캔", "키움 접속 실패 — 키와 모드를 확인하세요.")
-            return
-        self.btn_scan.setEnabled(False)
-        self.btn_scan.setText("스캔 중… 후보 조회")
-        self._scan_started = time.monotonic()
-        self._scan_worker = ScanWorker(self._make_screener(broker), kst_now())
-        self._scan_worker.progress.connect(self.on_scan_progress)
-        self._scan_worker.done.connect(self.on_scan_done)
-        self._scan_worker.start()
-
-    def on_scan_progress(self, done: int, total: int):
-        left = ""
-        if done:
-            secs = (time.monotonic() - self._scan_started) / done * (total - done)
-            left = f" (약 {secs / 60:.0f}분 남음)" if secs >= 90 else f" (약 {secs:.0f}초 남음)"
-        self.btn_scan.setText(f"스캔 중… {done}/{total}{left}")
-
-    def on_scan_done(self, res, err: str):
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("지금 스캔 (결과 미리보기)")
-        if err or res is None:
-            self.append_log("error", f"스캔 실패: {err}")
-            QMessageBox.critical(self, "스캔", f"스캔 실패:\n{err}")
-            return
-        self._preview = res
-        self._fill_watch_preview()
-        if res.errors:
-            self.append_log("warning", " / ".join(res.errors[:3]))
-        msg = (f"기준일 {res.prev_date or '-'} · 후보 {res.candidates_checked} → 선정 {len(res.hits)}종목\n\n" +
-               "\n".join(f"· {h.name}({h.symbol}) [{'+'.join(h.reasons)}] {h.detail}" for h in res.hits[:20]))
-        QMessageBox.information(self, "스캔 결과", msg if res.hits else msg + "\n조건을 만족한 종목이 없습니다.")
-
     def _fill_watch_preview(self):
-        """자동매매 시작 전 감시종목 표시 (스캔 미리보기 또는 고정 종목)"""
-        res = getattr(self, "_preview", None)
-        sc = self.cfg.get("screener", {})
-        if res is None and sc.get("enabled", True):
-            res = latest_cached(APP_DIR)
-        if res is not None:
-            rows = [(h.symbol, h.name, "+".join(h.reasons), h.detail) for h in res.hits]
-            title = f"감시 종목 — 최근 스캔 {len(rows)}종목 (기준일 {res.prev_date})"
-        elif sc.get("enabled", True):
+        """자동매매 시작 전 감시종목 표시 (후보 탐색은 시작 후에 돈다 → 고정 종목만 미리 보인다)"""
+        if self.cfg.get("scanner", {}).get("enabled", True):
             rows = []
-            cond = sc.get("condition_name")
-            title = ("감시 종목 — 장 전 자동 선정 예정 " +
-                     (f"(조건식 '{cond}' AND 매집)" if cond else "(조건식 미지정 → 전 시장 매집)"))
+            title = "감시 종목 — 자동매매 시작 후 실시간 후보 탐색"
         else:
-            rows = [(s_, n, "고정", "") for s_, n in self.watchlist]
+            rows = list(self.watchlist)
             title = f"감시 종목 — 고정 {len(rows)}종목"
         self.wl_box.setTitle(title)
         self.table_watch.setRowCount(len(rows))
-        for r, (sym, name, why, detail) in enumerate(rows):
-            for c, v in enumerate((sym, name, why, "-", "-", "-", "대기")):
+        for r, (sym, name) in enumerate(rows):
+            for c, v in enumerate((sym, name, "고정", "-", "-", "-", "대기")):
                 self.table_watch.setItem(r, c, _item(v))
-            self.table_watch.item(r, 2).setToolTip(detail)
 
     def open_selected_chart(self, *_):
         row = self.table_watch.currentRow()
@@ -831,12 +704,11 @@ class MainWindow(QMainWindow):
         sym_item = self.table_watch.item(row, 0)
         if sym_item is None:
             return
-        res = latest_cached(APP_DIR) if self.cfg["screener"].get("enabled", True) else None
         self._show_chart(sym_item.text(), self.table_watch.item(row, 1).text(),
-                         self.table_watch.item(row, 2).toolTip(), res.prev_date if res else "")
+                         self.table_watch.item(row, 2).toolTip(), "")
 
     def open_holding_chart(self, row: int, _col: int = 0):
-        """보유 표 더블클릭. 감시 종목이기도 하면 매집 근거까지 나오도록 감시 표 경로로 연다"""
+        """보유 표 더블클릭. 감시 종목이기도 하면 후보 정보까지 나오도록 감시 표 경로로 연다"""
         item = self.table_pos.item(row, 0)
         if item is None:
             return
@@ -1223,9 +1095,6 @@ class MainWindow(QMainWindow):
         if self._syncing_rules:
             return
         c = self.config
-        c.trade_start_time = self.te_start.time().toString("HH:mm")
-        c.trade_end_time = self.te_end.time().toString("HH:mm")
-        c.min_volume_ratio = round(self.spn_vol.value(), 2)
         c.stop_loss_rate = self.spn_sl.value()
         c.trailing_retrace_rate = self.spn_trail.value()
         c.trailing_retrace_rate_1r = self.spn_trail_1r.value()
@@ -1237,23 +1106,14 @@ class MainWindow(QMainWindow):
         c.eod_liquidation_time = self.te_eod.time().toString("HH:mm")
         c.carryover_sell_at_open = self.chk_carry.isChecked()
         c.allow_reentry_same_day = not self.chk_no_reentry.isChecked()
-        c.entry_strategies = [k for k in STRATEGY_KEYS if self.chk_strats[k].isChecked()]
-        c.entry_logic = "AND" if self.cmb_logic.currentIndex() == 1 else "OR"
-        c.smc_stop_mode = "fvg" if self.cmb_stop_mode.currentIndex() == 1 else "swing"
-        if not c.entry_strategies:
-            self.append_log("warning", "매수 전략이 하나도 선택되지 않았습니다 — 신규 매수 없음")
-        if self.engine:
-            self.engine.strategy.update_config(c)
-        update_strategy_fields(self.cfg, c)
+        update_strategy_fields(self.cfg, c)      # 엔진·브로커는 같은 설정 객체를 보고 있어 바로 반영된다
         save_config(self.cfg)
         self._refresh_preset_status()
 
     def _set_strategy_widgets(self, c):
         """on_settings_changed 의 반대 방향: 설정값 → 화면"""
-        for te, hhmm in ((self.te_start, c.trade_start_time), (self.te_end, c.trade_end_time),
-                         (self.te_eod, c.eod_liquidation_time)):
-            te.setTime(QTime.fromString(hhmm, "HH:mm"))
-        for spn, val in ((self.spn_vol, c.min_volume_ratio), (self.spn_sl, c.stop_loss_rate),
+        self.te_eod.setTime(QTime.fromString(c.eod_liquidation_time, "HH:mm"))
+        for spn, val in ((self.spn_sl, c.stop_loss_rate),
                          (self.spn_trail, c.trailing_retrace_rate), (self.spn_trail_1r, c.trailing_retrace_rate_1r),
                          (self.spn_trail_act, c.trailing_activation_rate),
                          (self.spn_amount, c.order_amount_per_trade), (self.spn_maxpos, c.max_concurrent_positions),
@@ -1262,10 +1122,6 @@ class MainWindow(QMainWindow):
         for chk, on in ((self.chk_eod, c.eod_liquidation), (self.chk_carry, c.carryover_sell_at_open),
                         (self.chk_no_reentry, not c.allow_reentry_same_day)):
             chk.setChecked(on)
-        for key, chk in self.chk_strats.items():
-            chk.setChecked(key in c.entry_strategies)
-        self.cmb_logic.setCurrentIndex(1 if str(c.entry_logic).upper() == "AND" else 0)
-        self.cmb_stop_mode.setCurrentIndex(1 if c.smc_stop_mode == "fvg" else 0)
 
     # ================================================================ 저장된 매매 규칙
     def _reload_presets(self, select: str = ""):
@@ -1291,9 +1147,6 @@ class MainWindow(QMainWindow):
         warnings = []
         if matching_rule_preset(self.cfg, self.config) is None:
             warnings.append("지금 화면의 값은 저장되어 있지 않아 사라집니다.")
-        if running and set(target.entry_strategies) - set(self.config.entry_strategies):
-            warnings.append("가동 중에 새로 켜는 매수 전략은 지금부터 받는 봉만 봅니다. "
-                            "첫 봉 기준 전략은 기준이 달라지므로 장 시작 전 적용을 권장합니다.")
         if running and self.mode == TradingMode.REAL:
             warnings.append("실계좌 자동매매가 가동 중이며 아래 규칙이 즉시 적용됩니다.\n\n" + self._rule_summary(target))
         if warnings:
@@ -1339,10 +1192,8 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 시작/중지
     def _rule_summary(self, c) -> str:
-        strategies = f" {str(c.entry_logic).upper()} ".join(
-            STRATEGY_LABELS[k] for k in STRATEGY_KEYS if k in c.entry_strategies)
         return (
-            f"· 매수 전략: {strategies or '없음'}\n"
+            f"· 전략: {self._strategy_summary()}\n"
             f"· 1회 매수 금액: {c.order_amount_per_trade:,}원\n"
             f"· 최대 동시 보유: {c.max_concurrent_positions}종목\n"
             f"· 일 손실한도: {c.max_daily_loss:,}원\n"
@@ -1381,11 +1232,13 @@ class MainWindow(QMainWindow):
             live_confirmed = True
 
         broker = KiwoomRestBroker(app_key, secret, mode=self.mode, config=self.config)
-        screener = self._make_screener(broker) if self.cfg["screener"].get("enabled", True) else None
-        if screener:   # 엔진 스레드에서 로그는 엔진 이벤트로 전달
-            screener.log = lambda lv, m: self.engine._emit(lv, m) if self.engine else None
+        scanner = (CandidateScanner(broker, ScannerConfig.from_dict(self.cfg["scanner"]))
+                   if self.cfg["scanner"].get("enabled", True) else None)
         self.engine = LiveTradingEngine(broker, self.config, self.watchlist, state_dir=APP_DIR, db=self.db,
-                                        notifier=self._make_notifier(), screener=screener)
+                                        notifier=self._make_notifier(), scanner=scanner,
+                                        manager=build_manager(self.cfg),
+                                        guard=CapitalGuard(self.config, RiskConfig.from_dict(self.cfg["risk"])),
+                                        bar_store=BarStore(os.path.join(APP_DIR, "bars.db")))
         self.worker = EngineWorker(self.engine, live_confirmed)
         self.worker.log_message.connect(lambda lv, m: self.append_log(lv, m, _from_engine=True))
         self.worker.started_ok.connect(self.on_engine_started)
@@ -1398,6 +1251,10 @@ class MainWindow(QMainWindow):
     def on_engine_started(self, ok: bool):
         if ok:
             self.btn_stop.setEnabled(True)
+            self.btn_halt.setEnabled(True)
+            halted = bool(self.engine.guard.emergency)       # 전날 건 비상 정지는 재시작해도 유지된다
+            self.btn_halt.setChecked(halted)
+            self.btn_halt.setText("신규 매수 재개" if halted else "신규 매수 중단")
             self.lbl_status.setText("상태: 자동매매 가동 중")
             self.statusBar.showMessage(f"[{'실거래' if self.mode == TradingMode.REAL else '모의거래'}] 자동매매 가동 중")
             self._start_retries = 0
@@ -1415,6 +1272,17 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.critical(self, "시작 실패", "키움 접속에 실패했습니다. 실행 로그와 'API 설정'을 확인하세요.")
 
+    def toggle_halt(self, checked: bool):
+        """비상 정지 — 신규 매수만 막고(다시 누르면 해제) 보유 종목 감시는 그대로 둔다"""
+        if not self.engine:
+            self.btn_halt.setChecked(False)
+            return
+        if checked:
+            self.engine.stop_new_entries("사용자 요청")
+        else:
+            self.engine.resume_entries()
+        self.btn_halt.setText("신규 매수 재개" if checked else "신규 매수 중단")
+
     def stop_trading(self):
         if self.worker:
             self.worker.stop()
@@ -1424,6 +1292,7 @@ class MainWindow(QMainWindow):
     def _reset_buttons(self):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_halt.setEnabled(False)
         self.btn_mock.setEnabled(True)
         self.btn_real.setEnabled(True)
 
@@ -1468,41 +1337,39 @@ class MainWindow(QMainWindow):
         active = sum(1 for m in snap["managed"].values() if m["status"] in ("BUYING", "HOLDING", "SELLING"))
         self.lbl_active.setText(f"관리 종목: {active} / {self.config.max_concurrent_positions}")
         if snap["halted"]:
-            self.lbl_status.setText("상태: 신규 매수 중단 (일 손실한도)")
+            self.lbl_status.setText("상태: 신규 매수 중단 — " + snap["halted"].split(" → ")[0].split(" (")[0])
 
         quotes = snap["quotes"]
         watch = snap["watchlist"]
-        screen = snap.get("screen", {})
-        status = snap.get("screen_status") or ""
+        status = snap.get("scan_status") or ""
         self.wl_box.setTitle(f"감시 종목 {len(watch)}개" + (f" — {status}" if status else ""))
         if self.table_watch.rowCount() != len(watch):
             self.table_watch.setRowCount(len(watch))
         for r, (sym, name) in enumerate(watch):
             st = snap["states"].get(sym, {})
             px = quotes.get(sym)
-            lvl = st.get("breakout_level")
-            info = screen.get(sym, {})
+            rank, chg, value = st.get("rank"), st.get("change_rate"), st.get("trade_value")
             self.table_watch.setItem(r, 0, _item(sym))
             self.table_watch.setItem(r, 1, _item(name))
-            why = "+".join(info.get("reasons", [])) or ("고정" if not self.engine.screener else "-")
-            it = _item(why)
-            if info.get("detail"):
-                it.setToolTip(info["detail"])
+            it = _item(rank if rank else ("고정" if not self.engine.scanner else "보유"))
+            if st.get("sources"):
+                it.setToolTip("후보 원천: " + ", ".join(st["sources"]))
             self.table_watch.setItem(r, 2, it)
             self.table_watch.setItem(r, 3, _item(f"{px:,.0f}" if px else "-"))
-            self.table_watch.setItem(r, 4, _item(f"{lvl:,.0f}" if lvl else "-"))
-            vol = st.get("first_bar_volume")
-            self.table_watch.setItem(r, 5, _item(f"{vol:,}" if vol else "-"))
+            self.table_watch.setItem(r, 4, _item(f"{chg:+.2f}%" if chg is not None else "-",
+                                                 color="#ff7b72" if (chg or 0) > 0 else "#79c0ff" if (chg or 0) < 0 else ""))
+            self.table_watch.setItem(r, 5, _item(f"{value / 1e8:,.0f}억" if value else "-"))
             m = snap["managed"].get(sym)
             if m and m["status"] in ("BUYING", "HOLDING", "SELLING"):
                 text, color = {"BUYING": ("매수 주문중", "#d29922"), "HOLDING": ("보유중", "#ff7b72"),
                                "SELLING": ("매도 주문중", "#d29922")}[m["status"]]
-            elif st.get("signal"):
-                text, color = "당일 신호 발생", "#ff7b72"
-            elif lvl and px:
-                text, color = ("기준선 위", "#3fb950") if px > lvl else ("기준선 아래", "#8b949e")
+            elif st.get("signals"):
+                text, color = "당일 신호: " + ", ".join(st["signals"]), "#ff7b72"
+            elif st.get("bars"):
+                vwap = st.get("vwap")
+                text, color = ("VWAP 위", "#3fb950") if px and vwap and px > vwap else ("VWAP 아래", "#8b949e")
             else:
-                text, color = "첫 봉 대기", "#8b949e"
+                text, color = "봉 대기", "#8b949e"
             self.table_watch.setItem(r, 6, _item(text, color=color))
 
         rows = []

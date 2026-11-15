@@ -9,23 +9,35 @@ import pytest
 from python_app.broker.kiwoom_rest import KiwoomRestBroker, _num, _code
 from python_app.engine.live_engine import LiveTradingEngine, EngineSettings
 from python_app.models.types import OrderSide, StrategyConfig, TradingMode
+from python_app.risk.capital_guard import CapitalGuard, RiskConfig
+from python_app.strategies.strategy_manager import StrategyManager
 from python_app.tests.fake_kiwoom import Clock, FakeKiwoom
+from python_app.tests.stubs import OpenCrossStub
 
 DAY = "20261020"   # 화요일
 
 
 def make_broker(fake: FakeKiwoom, mode=TradingMode.MOCK, config=None) -> KiwoomRestBroker:
     return KiwoomRestBroker("APPKEY", "SECRET", mode=mode, config=config or StrategyConfig(),
-                            session=fake, min_interval=0)
+                            session=fake, min_interval=0, account_min_interval=0)
 
 
-def make_engine(fake, clock, tmp_path, mode=TradingMode.MOCK, **cfg):
+NO_RISK_SIZING = dict(max_loss_per_trade=10 ** 9, max_consecutive_losses=0)   # 수량 = 1회 매수 금액 기준 (기존 시나리오용)
+
+
+def make_engine(fake, clock, tmp_path, mode=TradingMode.MOCK, strategies=None, scanner=None, bar_store=None,
+                db=None, watchlist=(("005930", "삼성전자"),), risk=None, **cfg):
+    """strategies 를 주지 않으면 스텁 전략(시가 돌파) 하나로 엔진 동작을 검증한다.
+    risk 를 주지 않으면 위험 기준 수량 계산을 끈다 (자금 보호 자체는 test_capital_guard 에서 검증)."""
     config = StrategyConfig(**cfg)
     broker = make_broker(fake, mode, config)
     events = []
-    eng = LiveTradingEngine(broker, config, [("005930", "삼성전자")], state_dir=str(tmp_path),
+    manager = StrategyManager([OpenCrossStub()] if strategies is None else strategies)
+    eng = LiveTradingEngine(broker, config, list(watchlist), state_dir=str(tmp_path),
                             clock=clock, settings=EngineSettings(bar_poll_delay_sec=3),
-                            on_event=lambda lv, m: events.append(m))
+                            on_event=lambda lv, m: events.append(m), manager=manager,
+                            scanner=scanner(broker) if scanner else None, bar_store=bar_store, db=db,
+                            guard=CapitalGuard(config, risk or RiskConfig(**NO_RISK_SIZING)))
     return eng, events
 
 
@@ -266,7 +278,7 @@ def test_no_new_buy_after_eod_time(tmp_path):
     fake = FakeKiwoom()
     seed_breakout_day(fake)
     clock = Clock(datetime(2026, 10, 20, 9, 6, 2))
-    eng, _ = make_engine(fake, clock, tmp_path, trade_end_time="15:30", eod_liquidation_time="09:05")
+    eng, _ = make_engine(fake, clock, tmp_path, eod_liquidation_time="09:05")
     eng.start(); eng.tick()
     assert not fake.api_calls("kt10000")
 
@@ -315,7 +327,7 @@ def test_old_config_migrates_activation_to_1pct(tmp_path):
     p = tmp_path / "config.json"
     p.write_text(json.dumps({"trading_mode": "MOCK", "trailing_activation_rate": 0.0}), encoding="utf-8")
     cfg = load_config(str(p))
-    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 6
+    assert cfg["trailing_activation_rate"] == 1.0 and cfg["config_version"] == 7
     assert strategy_config_from(cfg).trailing_activation_rate == 1.0
     # 이전 후 사용자가 다시 0으로 바꾸면 그대로 유지
     cfg["trailing_activation_rate"] = 0.0
@@ -330,3 +342,18 @@ def test_cash_balance_is_smaller_of_orderable_and_deposit():
                            ({"ord_alow_amt": "000000003000000"}, 0)):
         b._post = lambda *a, body=body, **k: (body, {})
         assert b.get_cash_balance() == expected
+
+
+def test_account_tr_throttled_to_one_per_second(monkeypatch):
+    """계좌 TR(kt00001·kt00018·ka10075)은 합쳐서 1초에 1회, 시세 TR은 기존 간격 그대로"""
+    import python_app.broker.kiwoom_rest as kr
+    t = [100.0]
+    sleeps = []
+    monkeypatch.setattr(kr.time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(kr.time, "sleep", lambda s: (sleeps.append(round(s, 2)), t.__setitem__(0, t[0] + s)))
+    broker = KiwoomRestBroker("APPKEY", "SECRET", session=FakeKiwoom(), min_interval=0.25, account_min_interval=1.0)
+    broker._throttle(broker.ACCOUNT_PATH)
+    broker._throttle(broker.ACCOUNT_PATH)     # 바로 이어진 계좌 TR → 1초 대기
+    broker._throttle(broker.STKINFO_PATH)     # 시세 TR → 0.25초만
+    broker._throttle(broker.ACCOUNT_PATH)     # 직전 계좌 TR 뒤 0.25초 지남 → 0.75초 더 대기
+    assert sleeps == [1.0, 0.25, 0.75]

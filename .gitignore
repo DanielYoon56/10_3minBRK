@@ -11,6 +11,9 @@ python_app/config.json
 python_app/live_state_*.json
 python_app/logs/
 *.db
+*.db.bak*
+*.json.bak*
+*.bak*
 *.log
 app.lock
 python_app/screen_*.json

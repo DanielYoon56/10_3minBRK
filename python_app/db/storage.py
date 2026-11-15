@@ -10,7 +10,7 @@ import sqlite3
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional
-from python_app.models.types import Order, OrderSide, OrderStatus, OrderType, Signal, SignalType, TradeRecord
+from python_app.models.types import Order, TradeRecord
 
 logger = logging.getLogger("Korea3MinBreakoutTrader.Database")
 
@@ -108,20 +108,29 @@ class DatabaseManager:
                     value TEXT NOT NULL
                 )
             """)
+            # 3WAYTRADING: 전략별 통계를 위해 나중에 추가된 열 (기존 DB 는 그대로 두고 열만 더한다)
+            for table, column, ddl in (("signals", "strategy", "TEXT"), ("signals", "pattern", "TEXT"),
+                                       ("signals", "stop_price", "REAL"), ("signals", "target_price", "REAL"),
+                                       ("signals", "confidence", "REAL"),
+                                       ("trades", "strategy", "TEXT"), ("trades", "mode", "TEXT")):
+                have = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column not in have:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             conn.commit()
             logger.info("SQLite 데이터베이스 초기화 완료 (%s)", self.db_path)
 
-    def save_signal(self, sig: Signal):
+    def save_signal(self, sig):
+        """StrategySignal 기록 (first_bar_* 등 예전 열은 비워 둔다)"""
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO signals (
-                    symbol, name, signal_type, price, first_bar_close,
-                    first_bar_volume, current_volume, volume_ratio, reason, bar_index, created_at
+                    symbol, name, signal_type, price, reason, created_at,
+                    strategy, pattern, stop_price, target_price, confidence
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                sig.symbol, sig.name, sig.signal_type.value, sig.price,
-                sig.first_bar_close, sig.first_bar_volume, sig.current_volume,
-                sig.volume_ratio, sig.reason, sig.bar_index, sig.timestamp.isoformat()
+                sig.symbol, sig.name, f"{sig.action}_{sig.key}".upper(), sig.entry_price, sig.reason,
+                sig.timestamp.isoformat(), sig.strategy, sig.pattern, sig.stop_price, sig.target_price,
+                sig.confidence
             ))
 
     def save_order(self, order: Order):
@@ -154,13 +163,29 @@ class DatabaseManager:
             conn.execute("""
                 INSERT OR REPLACE INTO trades (
                     trade_id, order_id, symbol, name, side, price, qty,
-                    commission, tax, realized_pnl, reason, executed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    commission, tax, realized_pnl, reason, executed_at, strategy, mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade.trade_id, trade.order_id, trade.symbol, trade.name,
                 trade.side.value, trade.price, trade.qty, trade.commission,
-                trade.tax, trade.realized_pnl, trade.reason, trade.executed_at.isoformat()
+                trade.tax, trade.realized_pnl, trade.reason, trade.executed_at.isoformat(),
+                trade.strategy, trade.mode
             ))
+
+    def get_strategy_stats(self, mode: str) -> List[Dict]:
+        """전략별 청산 성과 (매도 체결 기준, 수수료·세금 추정 차감 손익)"""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT strategy, COUNT(*) AS trades,
+                       SUM(realized_pnl > 0) AS wins, SUM(realized_pnl < 0) AS losses,
+                       SUM(realized_pnl) AS pnl,
+                       AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END) AS avg_win,
+                       AVG(CASE WHEN realized_pnl < 0 THEN realized_pnl END) AS avg_loss
+                FROM trades WHERE side = 'SELL' AND mode = ? AND strategy <> ''
+                GROUP BY strategy ORDER BY strategy
+            """, (mode,))
+            return [dict(row) for row in cur.fetchall()]
 
     def get_recent_signals(self, limit: int = 50) -> List[Dict]:
         with self._get_connection() as conn:

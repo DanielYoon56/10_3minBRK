@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout,
 )
 
-from python_app.strategy.smc import floor_to_tick
+from python_app.strategies.indicators import floor_to_tick
 
 UP_COLOR, DOWN_COLOR, JUDGE_COLOR = "#ff7b72", "#79c0ff", "#e3b341"
 BG_COLOR, GRID_COLOR, TEXT_COLOR = "#0d1117", "#21262d", "#8b949e"

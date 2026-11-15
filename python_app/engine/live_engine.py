@@ -1,19 +1,23 @@
 """
-Korea3MinBreakoutTrader - 실시간 자동매매 엔진 (키움 모의거래 / 실거래 공용)
+3WAYTRADING - 실시간 자동매매 엔진 (키움 모의거래 / 실거래 공용)
 
 GUI와 분리된 순수 로직. 워커 스레드가 tick()을 1초마다 호출한다.
+전략은 신호만 내고, 주문은 이 엔진만 낸다.
 
 [매수 흐름]
-  3분봉 마감 시각(09:03, 09:06, …)마다 감시종목 분봉 조회(ka10080)
-  → 새로 완성된 봉을 전략 조합(EntryCombiner: 선택한 전략들을 AND/OR)에 투입
-  → 매수 신호 + 진입 가능 조건 충족 시 시장가 매수(kt10000)
-  → SMC 신호는 FVG 중간값 지정가 매수: 유효 시각까지 미체결이면 취소, 체결 전 현재가가 손절가 이하면 취소
+  3분봉 마감 시각(09:03, 09:06, …)마다
+  → 후보 탐색기(CandidateScanner)가 당일 순위를 다시 조회해 감시종목을 교체
+  → 감시종목 분봉 조회(ka10080), 새로 완성된 봉을 저장하고 전략 관리자(StrategyManager)에 투입
+  → 전략별 신호(StrategySignal)를 후보 순위순으로 진입 조건 검사 후 주문(kt10000)
+  → 지정가 신호: 유효 시각까지 미체결이면 취소, 체결 전 현재가가 손절가 이하면 취소
+
+  → 모든 신호는 자금 보호(CapitalGuard)의 승인과 수량 계산을 거친다 (손실 한도, 노출 한도, 중복 주문 방지 등)
 
 [매도 흐름]
   앱이 매수한 종목만(관리종목) 2초마다 현재가 조회(ka10001)
-  → exit_rules.check_exit: 손절 -2% / 트레일링(+1% 이상 상승 후 상승분 되돌림: 1R 미만 50%, 1R 이상 30%)
-     (SMC 는 손절가만 전략 값, 나머지는 공통)
+  → 그 종목을 소유한 전략의 check_exit (기본: 손절 / 트레일링 / 목표가, 손절가는 전략이 준 값)
   → 시장가 매도(kt10001)
+  → 오버나이트 보유(hold_overnight) 포지션은 장 마감 일괄 청산·익일 시초 청산에서 제외
 
 [안전장치]
   - 계좌에 원래 있던 종목은 절대 매도하지 않음 (관리종목만 청산)
@@ -33,10 +37,12 @@ from datetime import datetime, time as dtime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
 from python_app.broker.kiwoom_rest import KiwoomRestBroker
-from python_app.models.types import (OrderSide, OrderStatus, OrderType, Position, Signal, StrategyConfig,
+from python_app.models.types import (Bar, OrderSide, OrderStatus, OrderType, Position, StrategyConfig,
                                      TradeRecord, TradingMode)
-from python_app.strategy.combiner import EntryCombiner
-from python_app.strategy.exit_rules import check_exit
+from python_app.risk.capital_guard import AccountState, CapitalGuard
+from python_app.strategies.base_strategy import MarketContext, StrategySignal
+from python_app.strategies.strategy_manager import StrategyManager
+from python_app.strategy.exit_rules import check_exit, stop_loss_price
 
 logger = logging.getLogger("Korea3MinBreakoutTrader.LiveEngine")
 
@@ -57,6 +63,7 @@ MARKET_OPEN = dtime(9, 0)
 LAST_ORDER_TIME = dtime(15, 20)   # 15:20~15:30 종가 동시호가 → 손절/트레일링 감시 중단
 CLOSING_AUCTION = dtime(15, 20)
 LAST_EOD_ORDER = dtime(15, 29, 30)  # 일괄청산 주문은 동시호가 중에도 접수 (15:30 종가 체결)
+LAST_BAR_POLL = dtime(15, 34, 30)   # 15:30 종가 단일가 봉(마감 15:33)까지 기록
 FEE_RATE = 0.00015
 TAX_RATE = 0.0020
 
@@ -76,8 +83,11 @@ class ManagedTrade:
     realized_pnl: float = 0.0
     signal_price: float = 0.0
     carried_over: bool = False        # 전일에서 넘어온 보유 (장 마감 청산 누락)
-    strategy: str = ""                # 진입 신호를 낸 전략 키
-    order_type: str = "MARKET"        # 매수 주문 방식 (LIMIT = SMC 지정가)
+    strategy: str = ""                # 이 포지션을 소유한 전략 (open / intraday / close) — 청산도 이 전략이 판정
+    pattern: str = ""                 # 전략 안의 진입 패턴
+    hold_overnight: bool = False      # 오버나이트 보유 (장 마감 일괄 청산·익일 시초 청산 제외)
+    entry_date: str = ""              # 매수 주문일 YYYYMMDD
+    order_type: str = "MARKET"        # 매수 주문 방식 (MARKET / LIMIT)
     stop_price: float = 0.0           # 전략 손절가 (0 = 매입가 × (1 - stop_loss_rate%))
     target_price: float = 0.0         # 차트에서 정한 목표가 (0 = 없음)
     use_trailing: bool = True         # 새 진입은 항상 True. False 는 예전 F 진입분(상태 파일)만 남아 있다
@@ -129,10 +139,14 @@ class LiveTradingEngine:
         on_event: Optional[Callable[[str, str], None]] = None,
         notifier=None,
         db=None,
-        screener=None,
+        scanner=None,
+        manager: Optional[StrategyManager] = None,
+        bar_store=None,
+        guard: Optional[CapitalGuard] = None,
     ):
         self.broker = broker
         self.config = config
+        self.fixed_watchlist = list(watchlist)    # 후보 탐색기를 쓰지 않을 때의 고정 감시종목
         self.watchlist = list(watchlist)
         self.clock = clock
         self.settings = settings or EngineSettings()
@@ -141,16 +155,21 @@ class LiveTradingEngine:
         self._push_seen: Dict[str, datetime] = {}
         self._summary_sent_date = ""
         self.db = db
-        self.screener = screener          # AccumulationScreener — 있으면 매일 매집 종목으로 감시종목 자동 교체
-        self.screen_info: Dict[str, Dict] = {}
-        self.screen_status = ""
-        self._screen_date = ""
-        self._screen_thread: Optional[threading.Thread] = None
-        self.strategy = EntryCombiner(config, prev_high_provider=self._prev_day_high)
+        self.scanner = scanner            # CandidateScanner — 있으면 감시종목을 장중에 계속 교체
+        self.bar_store = bar_store        # BarStore — 있으면 완성 3분봉·후보를 기록 (백테스트용)
+        self.manager = manager or StrategyManager()
+        if self.manager.daily_provider is None:
+            self.manager.daily_provider = self._daily_before
+        self.manager.live = broker.is_real      # 실거래에서는 live_enabled 를 켠 전략만 신규 진입
+        self.guard = guard or CapitalGuard(config)   # 모든 매수 신호의 승인·수량 계산
+        self._halt_announced = ""
+        self._api_fail_streak = 0
+        self._scan_error = ""
+        self.market_index: Optional[Dict[str, float]] = None
+        self._index_error = ""
         self.state_path = os.path.join(state_dir, f"live_state_{broker.mode.value}.json")
 
         self.running = False
-        self.halted_reason = ""
         self.trade_date = ""
         self.managed: Dict[str, ManagedTrade] = {}
         self.closed_today: List[ManagedTrade] = []   # 같은 날 재진입으로 managed 에서 밀려난 끝난 거래
@@ -159,7 +178,7 @@ class LiveTradingEngine:
         self.positions: Dict[str, Position] = {}
         self.last_quotes: Dict[str, float] = {}
         self.last_bar_close: Dict[str, float] = {}
-        self.signals: List[Signal] = []
+        self.signals: List[StrategySignal] = []
 
         self._last_fed: Dict[str, datetime] = {}
         self._last_bar_poll_idx = -1
@@ -201,6 +220,7 @@ class LiveTradingEngine:
             "realized_pnl": self.realized_pnl,
             "managed": {k: asdict(v) for k, v in self.managed.items()},
             "closed_today": [asdict(v) for v in self.closed_today],
+            "guard": self.guard.to_dict(),       # 주간 손익·연속 손실 누계 (재시작해도 유지)
         }
         tmp = self.state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -217,6 +237,7 @@ class LiveTradingEngine:
         except (OSError, ValueError) as e:
             self._emit("warning", f"상태 파일 읽기 실패 → 새로 시작: {e}")
             return
+        self.guard.load_dict(data.get("guard"))
         known = ManagedTrade.__dataclass_fields__    # 예전 상태 파일의 없어진 필드는 무시
         managed = {k: ManagedTrade(**{f: x for f, x in v.items() if f in known})
                    for k, v in (data.get("managed") or {}).items()}
@@ -250,14 +271,12 @@ class LiveTradingEngine:
         self._sync_account(force=True)
         self._last_bar_poll_idx = -1
         self.halted_reason = ""
-        if self.screener:
-            self.watchlist = []           # 오늘 매집 스캔이 끝나기 전에는 신규 매수 대상 없음
-            self.screen_status = "매집 스캔 대기"
+        self._update_watchlist()
         self.running = True
         held = [m.name for m in self.managed.values() if m.status == "HOLDING"]
-        target = "감시종목: 전일 매집 종목 자동 스캔" if self.screener else f"감시 {len(self.watchlist)}종목"
+        target = "감시종목: 실시간 후보 탐색" if self.scanner else f"고정 감시 {len(self.fixed_watchlist)}종목"
         self._emit("info", f"▶ 자동매매 시작 [{self.broker.mode_label}] {target} · "
-                           f"매수 전략: {self.strategy.describe()} · "
+                           f"전략: {self.manager.describe()} · "
                            f"주문가능 {self.cash:,.0f}원" + (f" · 관리중 {', '.join(held)}" if held else ""), push=True)
         return True
 
@@ -282,12 +301,14 @@ class LiveTradingEngine:
                 self._new_day(today)
 
             t = now.time()
-            self._maybe_start_screen(now)
             if t >= dtime(15, 31) and self._summary_sent_date != today:
                 self._summary_sent_date = today
                 self._sync_account()
                 self._daily_summary()
-            if t < MARKET_OPEN or t > dtime(15, 30):
+            if t < MARKET_OPEN or t > LAST_BAR_POLL:
+                return
+            if t > dtime(15, 30):
+                self._poll_bars_if_due(now)     # 종가 단일가 봉 기록만 (주문·청산 감시 없음)
                 return
 
             limit_waiting = any(m.is_limit_buy and (m.status == "BUYING" or m.buy_open)
@@ -304,6 +325,8 @@ class LiveTradingEngine:
                     if t <= LAST_EOD_ORDER:
                         self._last_exit_poll = now
                         self._liquidate_all(now)
+                        if t <= LAST_ORDER_TIME:
+                            self._check_exits(now)      # 일괄 청산 대상이 아닌 오버나이트 보유분 감시
                 elif t <= LAST_ORDER_TIME:
                     self._last_exit_poll = now
                     self._check_pending_limits(now)
@@ -325,63 +348,42 @@ class LiveTradingEngine:
         self._last_fed.clear()
         self._last_bar_poll_idx = -1
         self.signals.clear()
-        if self.screener:
-            self.watchlist = []
-            self.screen_info = {}
-            self.screen_status = "매집 스캔 대기"
+        if self.scanner:
+            self.scanner.candidates = {}
+            self.scanner.last_refresh = None
+        self._update_watchlist()
         self._save_state()
 
-    # ================================================================ 매집 종목 스캔
-    def _maybe_start_screen(self, now: datetime):
-        if not self.screener or self._screen_date == now.strftime("%Y%m%d"):
+    # ================================================================ 후보 탐색 (감시종목)
+    def _held_symbols(self) -> List[Tuple[str, str]]:
+        return [(m.symbol, m.name) for m in self.managed.values() if m.status in ("BUYING", "HOLDING", "SELLING")]
+
+    def _update_watchlist(self):
+        """감시종목 = 후보(없으면 고정 종목) + 보유 종목. 보유 종목은 후보에서 빠져도 봉을 계속 받는다."""
+        base = self.scanner.watchlist() if self.scanner else list(self.fixed_watchlist)
+        seen = {s for s, _ in base}
+        self.watchlist = base + [h for h in self._held_symbols() if h[0] not in seen]
+
+    def _refresh_candidates(self, now: datetime, idx: int):
+        if not self.scanner:
+            self._update_watchlist()
             return
-        if now.time() < dtime(8, 0) or now.time() > self.strategy.last_entry_time():
-            return
-        self._screen_date = now.strftime("%Y%m%d")
-        self._start_screen_thread(now, use_cache=True)
-
-    def request_rescan(self) -> bool:
-        """GUI [지금 스캔] — 캐시 무시하고 다시 스캔"""
-        if not self.screener or (self._screen_thread and self._screen_thread.is_alive()):
-            return False
-        self._screen_date = self.clock().strftime("%Y%m%d")
-        self._start_screen_thread(self.clock(), use_cache=False)
-        return True
-
-    def _start_screen_thread(self, now: datetime, use_cache: bool):
-        self.screen_status = "매집 스캔 중…"
-        self._emit("info", "🔍 전일 매집 종목 스캔 시작 (코스피·코스닥 전체)")
-        # 백그라운드 실행 → 스캔 동안에도 손절·트레일링 감시는 계속 (후보 1종목당 약 0.7초)
-        self._screen_thread = threading.Thread(target=self._run_screen, args=(now, use_cache),
-                                               name="screener", daemon=True)
-        self._screen_thread.start()
-
-    def _run_screen(self, now: datetime, use_cache: bool):
-        def progress(done: int, total: int):
-            self.screen_status = f"매집 스캔 중… {done}/{total}"
-
-        self.screener.progress = progress
-        try:
-            res = self.screener.run(now, use_cache=use_cache)
-        except Exception as e:
-            logger.exception("매집 스캔 오류")
-            with self._lock:
-                self.screen_status = "매집 스캔 실패"
-            self._emit("error", f"⚠ 매집 스캔 실패: {e} — 오늘 신규 매수 없음 ([지금 스캔]으로 재시도 가능)")
-            return
-        with self._lock:
-            self.watchlist = res.watchlist()
-            self.screen_info = {h.symbol: {"reasons": h.reasons, "detail": h.detail} for h in res.hits}
-            self.screen_status = f"매집 {len(res.hits)}종목 (기준일 {res.prev_date})"
-        if res.hits:
-            names = ", ".join(f"{h.name}[{'+'.join(h.reasons)}]" for h in res.hits[:15])
-            more = f" 외 {len(res.hits) - 15}" if len(res.hits) > 15 else ""
-            self._emit("info", f"🔍 오늘 감시종목 {len(res.hits)}개 (전일 {res.prev_date} 매집): {names}{more}", push=True)
-        elif res.errors:
-            self._emit("error", f"⚠ 매집 스캔 실패 ({res.errors[0]}) — 오늘 신규 매수 없음")
-        else:
-            self._emit("warning", f"🔍 전일({res.prev_date}) 매집 조건을 만족한 종목이 없습니다 — 오늘 신규 매수 없음",
-                       push=True)
+        every = max(1, int(self.scanner.cfg.refresh_every_bars))
+        if self.scanner.last_refresh is None or idx % every == 0:
+            added, removed = self.scanner.refresh(now, self.manager.sessions)
+            err = self.scanner.last_error
+            if err and err != self._scan_error:
+                self._emit("warning", f"🔍 후보 조회 오류: {err} — 기존 후보 {len(self.scanner.candidates)}종목 유지")
+            self._scan_error = err
+            if added:
+                names = ", ".join(c.name for c in added[:10]) + (f" 외 {len(added) - 10}" if len(added) > 10 else "")
+                self._emit("info", f"🔍 후보 {len(self.scanner.candidates)}종목 (+{len(added)} / -{len(removed)}): {names}")
+            if self.bar_store and (added or removed or self.scanner.last_refresh == now):
+                try:
+                    self.bar_store.save_candidates(now, self.scanner.candidates.values())
+                except Exception as e:
+                    logger.error("후보 기록 오류: %s", e)
+        self._update_watchlist()
 
     # ================================================================ 계좌 동기화
     def _sync_account(self, force: bool = False):
@@ -488,6 +490,8 @@ class LiveTradingEngine:
         m.realized_pnl = gross - fees
         m.status = "CLOSED"
         self.realized_pnl += m.realized_pnl
+        self.manager.record_trade(m.strategy, m.realized_pnl)
+        self.guard.record_close(m.strategy, m.realized_pnl, self.clock())
         how = "수동 청산 감지" if manual else "매도 체결"
         icon = "🔴" if m.realized_pnl < 0 else "🟢"
         self._emit("info", f"{icon} {how} {m.name} {m.qty}주 ≈{px:,.0f}원 → 추정손익 {m.realized_pnl:+,.0f}원 "
@@ -504,7 +508,8 @@ class LiveTradingEngine:
             m.buy_filled_at = self.clock().isoformat()
         partial = 0 < m.qty < m.order_qty
         self._record_fill(m.buy_order_id, m, OrderSide.BUY, m.entry_price, m.qty,
-                          datetime.fromisoformat(m.buy_filled_at), reason=m.strategy,
+                          datetime.fromisoformat(m.buy_filled_at),
+                          reason=f"{m.strategy}.{m.pattern}" if m.pattern else m.strategy,
                           status=OrderStatus.PARTIALLY_FILLED if partial else OrderStatus.FILLED)
 
     def _record_fill(self, order_id: str, m: ManagedTrade, side: OrderSide, price: float, qty: int, at: datetime,
@@ -520,7 +525,7 @@ class LiveTradingEngine:
             self.db.save_trade(TradeRecord(
                 trade_id=f"{at:%Y%m%d}-{order_id or m.symbol + '-MANUAL'}", order_id=order_id, symbol=m.symbol,
                 name=m.name, side=side, price=price, qty=qty, commission=fee, tax=tax, realized_pnl=pnl,
-                executed_at=at, reason=reason))
+                executed_at=at, reason=reason, strategy=m.strategy, mode=self.broker.mode.value))
         except Exception as e:
             logger.error("체결 기록 오류 (%s %s): %s", m.name, side.value, e)
 
@@ -636,18 +641,19 @@ class LiveTradingEngine:
             pos.current_price = price
             pos.avg_price = m.entry_price or pos.avg_price
             pos.highest_price = max(m.highest_price, pos.highest_price, pos.avg_price)
-            if m.stop_price > 0:
-                pos.stop_loss_price = m.stop_price
+            owner = self.manager.strategy(m.strategy)     # 청산은 이 포지션을 소유한 전략이 판정
+            exit_cfg = owner.exit_config(self.config) if owner else self.config
+            pos.stop_loss_price = m.stop_price if m.stop_price > 0 else stop_loss_price(pos.avg_price, exit_cfg)
 
-            if m.carried_over and self.config.carryover_sell_at_open:
+            if m.carried_over and self.config.carryover_sell_at_open and not m.hold_overnight:
                 self._sell(m, pos, price, "전일 이월 종목 시초 청산 (전날 장 마감 청산 누락)", now)
                 continue
 
-            decision = check_exit(pos, price, self.config, take_profit_price=m.target_price,
-                                  use_trailing=m.use_trailing,
-                                  stop_label=("(수동 손절가)" if m.stop_manual
-                                              else "(전략 손절가)" if m.stop_price > 0 else ""),
-                                  risk_stop=m.risk_stop)
+            kw = dict(take_profit_price=m.target_price, use_trailing=m.use_trailing,
+                      stop_label=("(수동 손절가)" if m.stop_manual else "(전략 손절가)" if m.stop_price > 0 else ""),
+                      risk_stop=m.risk_stop)
+            decision = (owner.check_exit(pos, price, self.config, now, trade=m, **kw) if owner
+                        else check_exit(pos, price, self.config, **kw))
             if pos.highest_price > m.highest_price:
                 m.highest_price = pos.highest_price
                 self._save_state()
@@ -686,7 +692,9 @@ class LiveTradingEngine:
         return bool(self.config.eod_liquidation) and now.time() >= self._eod_time()
 
     def _liquidate_all(self, now: datetime):
-        targets = [(s, m) for s, m in self.managed.items() if m.status == "HOLDING" and s in self.positions]
+        # 오버나이트 보유분은 매수한 날에는 청산하지 않는다 (다음 거래일부터는 일괄 청산 대상 → 최대 1일 보유)
+        targets = [(s, m) for s, m in self.managed.items() if m.status == "HOLDING" and s in self.positions
+                   and not (m.hold_overnight and not m.carried_over)]
         if targets and not self._eod_logged:
             self._eod_logged = True
             self._emit("warning", f"■ 장 마감 일괄 청산 시작 ({self.config.eod_liquidation_time}) — "
@@ -699,19 +707,30 @@ class LiveTradingEngine:
             self._sell(m, pos, price, f"장 마감 일괄 청산 ({self.config.eod_liquidation_time})", now)
 
     # ================================================================ 진입
-    def _prev_day_high(self, symbol: str, trade_date: str) -> Optional[float]:
-        """D. 전일 고가 돌파용 — 일봉(ka10081)에서 trade_date 직전 거래일 고가 (전략이 종목·날짜별로 캐시)"""
-        rows = [r for r in self.broker.get_daily_bars(symbol, trade_date) if r["dt"] < trade_date]
-        return rows[-1]["high"] if rows else None
+    def _daily_before(self, symbol: str, trade_date: str) -> List[dict]:
+        """trade_date(YYYYMMDD) '이전' 일봉 (오래된 순). 당일 일봉은 장중 미완성이라 넘기지 않는다."""
+        return [r for r in self.broker.get_daily_bars(symbol, trade_date) if r["dt"] < trade_date]
+
+    def _fetch_index(self) -> Optional[Dict[str, float]]:
+        """코스피·코스닥 지수 등락률. change_rate 는 둘 중 약한 쪽 (보수적). 조회 실패면 None — 전략은 지수 조건을 판정하지 않는다"""
+        if not self.manager.needs_index():
+            return None
+        try:
+            kospi = self.broker.get_index("0", "001")["change_rate"]
+            kosdaq = self.broker.get_index("1", "101")["change_rate"]
+        except Exception as e:
+            if str(e) != self._index_error:
+                self._emit("warning", f"지수 조회 실패 → 이번 주기는 지수 조건 없이 판정: {e}")
+            self._index_error = str(e)
+            return None
+        self._index_error = ""
+        return {"kospi": kospi, "kosdaq": kosdaq, "change_rate": min(kospi, kosdaq)}
 
     def _bar_index(self, now: datetime) -> int:
         start = now.replace(hour=9, minute=0, second=0, microsecond=0)
         return int((now - start).total_seconds() // 180)
 
     def _poll_bars_if_due(self, now: datetime):
-        end_t = self.strategy.last_entry_time()
-        if now.time() > (datetime.combine(now.date(), end_t) + timedelta(minutes=4)).time():
-            return
         idx = self._bar_index(now)
         boundary = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(minutes=3 * idx)
         if idx <= self._last_bar_poll_idx:
@@ -722,98 +741,121 @@ class LiveTradingEngine:
             return
         self._last_bar_poll_idx = idx
 
-        pending: List[Signal] = []
+        self._refresh_candidates(now, idx)
+        self.market_index = self._fetch_index()
+        pending: List[StrategySignal] = []
+        fresh: List[Bar] = []
         try:
             for sym, name in self.watchlist:
                 try:
                     bars = self.broker.get_minute_bars(sym, self.trade_date, now, tic=3)
                 except Exception as e:
+                    self._api_fail_streak += 1
                     self._emit("warning", f"[{name}] 3분봉 조회 실패: {e}")
                     continue
+                self._api_fail_streak = 0
                 if bars:
                     self.last_bar_close[sym] = bars[-1].close
                 last = self._last_fed.get(sym)
+                ctx = MarketContext(now=now, candidate=self.scanner.get(sym) if self.scanner else None,
+                                    index=self.market_index)
                 for bar in bars:
                     if not bar.is_completed or (last and bar.timestamp <= last):
                         continue
                     self._last_fed[sym] = bar.timestamp
-                    sig = self.strategy.process_bar(bar, name)
-                    if sig:
-                        pending.append(sig)
+                    fresh.append(bar)
+                    pending.extend(self.manager.on_bar(bar, name, ctx))
         finally:
-            # 전 종목 신호를 모은 뒤 충족 조건이 많은 순으로 매수 (같으면 감시종목 순서 유지)
-            for sig in sorted(pending, key=self._matched_conditions, reverse=True):
+            if self.bar_store and fresh:
+                try:
+                    self.bar_store.save_bars(fresh)
+                except Exception as e:
+                    logger.error("3분봉 기록 오류: %s", e)
+            # 전 종목 신호를 모은 뒤 후보 순위가 높은 종목부터 매수 (순위는 우선순위에만 쓴다)
+            for sig in sorted(pending, key=lambda s: self.scanner.rank_of(s.symbol) if self.scanner else 0):
                 self._on_signal(sig, now)
 
-    def _matched_conditions(self, sig: Signal) -> int:
-        """충족한 OR 조건 수 = 매수 전략 수 + 매집 조건(① 거래량·캔들, ② 수급) 수"""
-        reasons = self.screen_info.get(sig.symbol, {}).get("reasons", [])
-        return sig.matched_strategies + ("①" in reasons) + any(r.startswith("②") for r in reasons)
-
-    def _on_signal(self, sig: Signal, now: datetime):
+    def _on_signal(self, sig: StrategySignal, now: datetime):
         self.signals.append(sig)
         if self.db:
             try:
                 self.db.save_signal(sig)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("신호 기록 오류 (%s): %s", sig.name, e)
         age = (now - sig.timestamp).total_seconds()
         if age > self.settings.stale_signal_sec:
             self._emit("info", f"○ 과거 신호 기록만 함 (진입 안 함): {sig.name} {sig.timestamp:%H:%M} — {sig.reason}")
             return
-        self._emit("info", f"★ 매수 신호 [조건 {self._matched_conditions(sig)}개] {sig.name} "
-                           f"{sig.timestamp:%H:%M} — {sig.reason}")
+        self._emit("info", f"★ 매수 신호 {sig.name} {sig.timestamp:%H:%M} — {sig.reason}")
         self._try_buy(sig, now)
 
-    def _active_count(self) -> int:
-        return sum(1 for m in self.managed.values() if m.status in ("BUYING", "HOLDING", "SELLING"))
+    # ---------------------------------------------------------------- 자금 보호
+    @property
+    def halted_reason(self) -> str:
+        """신규 매수가 멈춘 사유 (비상 정지 또는 손실 한도). 빈 문자열 = 정상"""
+        return (f"비상 정지 ({self.guard.emergency})" if self.guard.emergency else self.guard.halted_reason)
 
-    def _check_daily_loss(self) -> bool:
-        unreal = 0.0
-        for m in self.managed.values():
-            if m.status == "HOLDING" and m.symbol in self.last_quotes:
-                unreal += (self.last_quotes[m.symbol] - m.entry_price) * m.qty
-        if self.realized_pnl + unreal <= -abs(self.config.max_daily_loss):
-            if not self.halted_reason:
-                self.halted_reason = (f"일 손실한도 도달 ({self.realized_pnl + unreal:+,.0f}원 ≤ "
-                                      f"-{self.config.max_daily_loss:,}원) → 신규 매수 중단")
-                self._emit("warning", "⛔ " + self.halted_reason, push=True)
-            return False
-        return True
+    @halted_reason.setter
+    def halted_reason(self, value: str):
+        self.guard.halted_reason = value
 
-    def _try_buy(self, sig: Signal, now: datetime):
+    def stop_new_entries(self, reason: str = "사용자 요청"):
+        """비상 정지 — 신규 매수만 막는다. 보유 종목의 손절·청산 감시는 계속된다."""
+        with self._lock:
+            self.guard.stop_new_entries(reason)
+            self._save_state()
+        self._emit("warning", f"⛔ 비상 정지: 신규 매수 중단 ({reason}) — 보유 종목 감시는 계속", push=True)
+
+    def resume_entries(self):
+        with self._lock:
+            self.guard.resume()
+            self._save_state()
+        self._emit("info", "▶ 비상 정지 해제: 신규 매수 재개", push=True)
+
+    def _account_state(self, now: datetime) -> AccountState:
+        active = {s: m for s, m in self.managed.items() if m.status in ("BUYING", "HOLDING", "SELLING")}
+        amount = lambda m: (m.entry_price or m.signal_price) * (m.qty or m.order_qty)
+        unreal = sum((self.last_quotes[s] - m.entry_price) * m.qty for s, m in active.items()
+                     if m.status == "HOLDING" and s in self.last_quotes)
+        limit = self.settings.order_timeout_sec * 3
+        uncertain = [m.name for m in active.values()
+                     if m.status in ("BUYING", "SELLING") and not (m.is_limit_buy and m.status == "BUYING")
+                     and m.order_dt() and (now - m.order_dt()).total_seconds() > limit]
+        self.guard.roll(now)
+        self.guard.realized_today = self.realized_pnl        # 당일 실현손익은 엔진 값이 기준 (상태 파일에서 복원됨)
+        return AccountState(
+            cash=self.cash,
+            active={s: m.strategy for s, m in active.items()},
+            overnight={s for s, m in active.items() if m.hold_overnight},
+            exposure=sum(amount(m) for m in active.values()),
+            overnight_exposure=sum(amount(m) for m in active.values() if m.hold_overnight),
+            account_symbols=set(self.positions),
+            closed_today={s for s, m in self.managed.items() if m.status == "CLOSED"},
+            unrealized=unreal,
+            data_problem=("후보 갱신 지연" if self.scanner and self.scanner.is_stale(now) else ""),
+            api_fail_streak=self._api_fail_streak,
+            uncertain_orders=uncertain,
+        )
+
+    def _try_buy(self, sig: StrategySignal, now: datetime):
         sym = sig.symbol
-        skip = None
-        if now.time() > LAST_ORDER_TIME:
-            skip = "장 마감 임박"
-        elif self._eod_due(now):
-            skip = f"장 마감 청산 시각({self.config.eod_liquidation_time}) 이후"
-        elif self.halted_reason or not self._check_daily_loss():
-            skip = self.halted_reason
-        elif sym in self.positions:
-            skip = "이미 계좌에 보유 중인 종목"
-        elif sym in self.managed and self.managed[sym].status in ("BUYING", "HOLDING", "SELLING"):
-            skip = "이미 진행 중인 주문/보유"
-        elif (sym in self.managed and self.managed[sym].status == "CLOSED"
-              and not self.config.allow_reentry_same_day):
-            skip = "당일 이미 매매한 종목 (재진입 금지)"
-        elif sig.expire_at and now >= sig.expire_at:
-            skip = "지정가 유효시각 경과"
-        elif self._active_count() >= self.config.max_concurrent_positions:
-            skip = f"최대 동시 보유 {self.config.max_concurrent_positions}종목 도달"
-        if skip:
-            self._emit("info", f"  └ 진입 생략 ({sig.name}): {skip}")
+        decision = self.guard.evaluate(sig, self._account_state(now), now)
+        if decision.approved:                      # 승인된 신호만 예수금을 새로 조회해 수량을 다시 계산
+            self.cash = self.broker.get_cash_balance()
+            state = self._account_state(now)
+            decision = self.guard.size(sig, state)
+        halt = self.guard.halted_reason
+        if halt and halt != self._halt_announced:
+            self._halt_announced = halt
+            self._emit("warning", "⛔ " + halt, push=True)
+        if not decision.approved:
+            short = decision.reason.startswith("주문가능금액 부족")
+            self._emit("warning" if short else "info", f"  └ 진입 생략 ({sig.name}): {decision.reason}", push=short)
             return
-
-        self.cash = self.broker.get_cash_balance()
-        budget = min(float(self.config.order_amount_per_trade), self.cash)
-        qty = int(budget // (sig.price * (1 + FEE_RATE))) if sig.price > 0 else 0
-        if qty < 1:
-            self._emit("warning", f"  └ 진입 생략 ({sig.name}): 주문가능금액 부족 ({self.cash:,.0f}원)", push=True)
-            return
+        qty = decision.qty
 
         is_limit = sig.order_type == OrderType.LIMIT
-        order = self.broker.submit_order(sym, sig.name, OrderSide.BUY, qty, price=sig.price,
+        order = self.broker.submit_order(sym, sig.name, OrderSide.BUY, qty, price=sig.entry_price,
                                          order_type=sig.order_type, reason=sig.reason)
         if not order:
             self._emit("error", f"  └ 매수 주문 실패 ({sig.name}) — 로그 확인")
@@ -823,17 +865,19 @@ class LiveTradingEngine:
             self.closed_today.append(previous)
         self.managed[sym] = ManagedTrade(
             symbol=sym, name=sig.name, status="BUYING", order_id=order.order_id, buy_order_id=order.order_id,
-            order_time=now.isoformat(), qty=qty, highest_price=sig.price, signal_price=sig.price,
-            strategy=sig.strategy, order_type=sig.order_type.value,
-            stop_price=sig.stop_loss_price if is_limit else 0.0,   # 시장가 전략은 기존대로 매입가 기준 -N%
+            order_time=now.isoformat(), qty=qty, highest_price=sig.entry_price, signal_price=sig.entry_price,
+            strategy=sig.strategy, pattern=sig.pattern, order_type=sig.order_type.value,
+            stop_price=sig.stop_price or 0.0,       # 전략 손절가. 없으면 0 = 매입가 × (1 - stop_loss_rate%)
+            target_price=sig.target_price or 0.0,
+            hold_overnight=sig.hold_overnight, entry_date=self.trade_date,
             expire_at=sig.expire_at.isoformat() if sig.expire_at else "", order_qty=qty,
         )
         if self.db:
             self.db.save_order(order)
         self._save_state()
         self._last_sync = datetime.min
-        how = (f"지정가 {sig.price:,.0f}원, {sig.expire_at:%H:%M}까지" if is_limit and sig.expire_at
-               else f"시장가, 신호가 {sig.price:,.0f}원")
+        how = (f"지정가 {sig.entry_price:,.0f}원, {sig.expire_at:%H:%M}까지" if is_limit and sig.expire_at
+               else f"시장가, 신호가 {sig.entry_price:,.0f}원")
         self._emit("info", f"📈 매수 주문 {sig.name} {qty}주 ({how})\n{sig.reason}", push=True)
 
     def _daily_summary(self):
@@ -855,16 +899,22 @@ class LiveTradingEngine:
         with self._lock:
             states = {}
             for sym, _ in self.watchlist:
-                st = self.strategy.symbol_states.get(sym)
+                s = self.manager.sessions.get(sym)
+                c = self.scanner.get(sym) if self.scanner else None
                 states[sym] = {
-                    "breakout_level": st.breakout_level if st else None,
-                    "first_bar_volume": st.first_bar_volume if st else None,
-                    "signal": st.signal_fired_today if st else False,
+                    "rank": c.rank if c else None,
+                    "change_rate": c.change_rate if c else None,
+                    "trade_value": c.trade_value if c else None,
+                    "sources": list(c.sources) if c else [],
+                    "vwap": s.vwap if s and s.bars else None,
+                    "bars": len(s.bars) if s else 0,
+                    "signals": self.manager.fired_today(sym),
                 }
             return {
                 "watchlist": list(self.watchlist),
-                "screen": dict(self.screen_info),
-                "screen_status": self.screen_status,
+                "scan_status": self.scanner.status(self.clock()) if self.scanner else "",
+                "strategies": self.manager.stats_snapshot(),
+                "index": dict(self.market_index) if self.market_index else None,
                 "mode": self.broker.mode_label,
                 "running": self.running,
                 "halted": self.halted_reason,

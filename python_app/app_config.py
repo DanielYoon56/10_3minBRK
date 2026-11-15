@@ -17,6 +17,9 @@ from dataclasses import asdict, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 from python_app.models.types import StrategyConfig, TradingMode
+from python_app.risk.capital_guard import RiskConfig
+from python_app.strategies.candidate_scanner import ScannerConfig
+from python_app.strategies.strategy_manager import STRATEGY_CLASSES
 
 if getattr(sys, "frozen", False):
     # PyInstaller EXE: 사용자 파일은 EXE 옆, 템플릿은 번들 내부
@@ -29,6 +32,10 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 EXAMPLE_PATH = os.path.join(_BUNDLE_DIR, "config.example.json")
 
 _STRATEGY_KEYS = {f.name for f in fields(StrategyConfig)}
+_REMOVED_V7 = ("trade_start_time", "trade_end_time", "breakout_reference", "min_volume_ratio",
+               "use_first_bar_low_stop", "entry_strategies", "entry_logic", "vwap_trend_pct", "vwap_touch_pct",
+               "dsh_swing_len", "smc_swing_len", "smc_stop_mode", "smc_min_risk_pct", "smc_max_risk_pct",
+               "smc_fvg_expiry_bars")
 
 
 def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
@@ -66,17 +73,31 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
             for k in ("vwap_end_time", "dsh_start_time", "dsh_end_time", "smc_start_time", "smc_end_time"):
                 target.pop(k, None)
         cfg["config_version"] = 6
-    kw =cfg.setdefault("kiwoom", {})
+    # v7 = 3WAYTRADING: 기존 매수 전략(A~F)·매집 스캔 폐기 → 전략별 설정(strategies)·실시간 후보 탐색(scanner)
+    if int(cfg["config_version"]) < 7:
+        for target in (cfg, *cfg.get("rule_presets", {}).values()):
+            for k in _REMOVED_V7:
+                target.pop(k, None)
+        cfg.pop("screener", None)
+        cfg["config_version"] = 7
+    kw = cfg.setdefault("kiwoom", {})
     for mode in ("mock", "real"):
         kw.setdefault(mode, {"app_key": "", "secret_key": ""})
     tg = cfg.setdefault("telegram", {})
     for k, v in (("enabled", False), ("bot_token", ""), ("chat_id", "")):
         tg.setdefault(k, v)
-    from dataclasses import asdict as _asdict
-    from python_app.screener.accumulation import ScreenerConfig
-    sc = cfg.setdefault("screener", {})
-    for k, v in _asdict(ScreenerConfig()).items():
+    sc = cfg.setdefault("scanner", {})
+    for k, v in asdict(ScannerConfig()).items():
         sc.setdefault(k, v)
+    rk = cfg.setdefault("risk", {})
+    for k, v in asdict(RiskConfig()).items():
+        rk.setdefault(k, v)
+    blocks = cfg.setdefault("strategies", {})
+    blocks.pop("intraday", None)
+    for name, cls in STRATEGY_CLASSES.items():     # 등록된 전략의 빠진 설정을 기본값으로 채운다
+        block = blocks.setdefault(name, {})
+        for k, v in asdict(cls.settings_class()).items():
+            block.setdefault(k, v)
     au = cfg.setdefault("autostart", {})
     for k, v in (("auto_start_trading", True), ("allow_real_autostart", False),
                  ("quit_after_close", True), ("quit_time", "15:40")):

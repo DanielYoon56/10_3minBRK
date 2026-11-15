@@ -10,12 +10,7 @@ from typing import Optional, List, Dict, Any
 
 
 class SignalType(str, Enum):
-    BUY_BREAKOUT = "BUY_BREAKOUT"            # A. 첫 3분봉 시가 돌파 (기본 전략)
-    BUY_ORB_HIGH = "BUY_ORB_HIGH"            # B. 첫 3분봉 고가 돌파
-    BUY_VWAP_PULLBACK = "BUY_VWAP_PULLBACK"  # C. VWAP 눌림 반등
-    BUY_PREV_HIGH = "BUY_PREV_HIGH"          # D. 전일 고가 돌파
-    BUY_DAY_SWING_HIGH = "BUY_DAY_SWING_HIGH"  # E. 당일 전고점(스윙 고점) 돌파
-    BUY_SMC_FVG = "BUY_SMC_FVG"              # F. SMC: CHoCH 후 첫 FVG 중간값 지정가 진입
+    # 매수 신호는 strategies.base_strategy.StrategySignal (전략·패턴 이름으로 구분)
     SELL_STOP_LOSS = "SELL_STOP_LOSS"
     SELL_TAKE_PROFIT = "SELL_TAKE_PROFIT"
     SELL_TRAILING_STOP = "SELL_TRAILING_STOP"
@@ -83,52 +78,6 @@ class Quote:
     timestamp: datetime
     bid_price_1: float = 0.0
     ask_price_1: float = 0.0
-
-
-@dataclass
-class Signal:
-    """전략 매매 신호 모델"""
-    symbol: str
-    name: str
-    signal_type: SignalType
-    price: float
-    timestamp: datetime
-    first_bar_close: float
-    first_bar_volume: int
-    current_volume: int
-    volume_ratio: float
-    reason: str
-    bar_index: int = 0
-    breakout_level: float = 0.0     # 돌파 기준가 (기본: 첫 3분봉 시가)
-    stop_loss_price: float = 0.0    # 진입가 기준 손절가 (기본 -2%)
-    strategy: str = "open_breakout"  # 신호를 낸 전략 키 (AND 조합이면 'a+b')
-    order_type: Optional[OrderType] = None  # None → MARKET. SMC 는 LIMIT (FVG 중간값 지정가)
-    expire_at: Optional[datetime] = None  # 지정가 주문 유효 시각 (지나면 미체결 취소)
-    matched_strategies: int = 1     # 이 종목에서 당일 신호를 낸 매수 전략 수 (많을수록 먼저 매수)
-
-    def __post_init__(self):
-        if self.order_type is None:
-            self.order_type = OrderType.MARKET
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "name": self.name,
-            "signal_type": self.signal_type.value,
-            "price": self.price,
-            "timestamp": self.timestamp.isoformat(),
-            "first_bar_close": self.first_bar_close,
-            "first_bar_volume": self.first_bar_volume,
-            "current_volume": self.current_volume,
-            "volume_ratio": round(self.volume_ratio, 2),
-            "reason": self.reason,
-            "bar_index": self.bar_index,
-            "breakout_level": self.breakout_level,
-            "stop_loss_price": self.stop_loss_price,
-            "strategy": self.strategy,
-            "order_type": self.order_type.value,
-            "expire_at": self.expire_at.isoformat() if self.expire_at else None,
-        }
 
 
 @dataclass
@@ -206,58 +155,29 @@ class TradeRecord:
     realized_pnl: float
     executed_at: datetime
     reason: str = ""
+    strategy: str = ""    # 이 거래를 소유한 전략 (open / intraday / close)
+    mode: str = ""        # MOCK / REAL
 
 
 @dataclass
 class StrategyConfig:
-    """3분봉 돌파 전략 파라미터 설정"""
-    # 진입 허용 시간대 (HH:MM)
-    trade_start_time: str = "09:03"
-    trade_end_time: str = "10:00"
-    
-    # 돌파 기준가: "open" = 첫 3분봉 시가 돌파(기본), "close" = 첫 3분봉 종가 돌파(구버전)
-    breakout_reference: str = "open"
-
-    # 손익 관리
-    stop_loss_rate: float = 2.0       # 손절 기준 (%) — 진입가 대비 -2%
+    """공통 매매 설정 — 청산 규칙과 자금 관리. 진입 조건·시간대는 전략별 설정(config.json 의 strategies)에 있다."""
+    # 손익 관리 (전략이 따로 정하지 않은 값의 기본)
+    stop_loss_rate: float = 2.0       # 손절 기준 (%) — 전략이 손절가를 주지 않았을 때 진입가 대비
     trailing_retrace_rate: float = 50.0  # 트레일링 스탑: 최고가 1R 미만일 때 상승분(최고가-진입가)의 N% 되돌림 시 청산 (0 = 사용 안 함)
     trailing_retrace_rate_1r: float = 30.0  # 최고가가 1R(진입가-손절가) 이상일 때 되돌림 N% (0 = 구간 구분 없음)
     trailing_activation_rate: float = 1.0  # 트레일링 발동 조건: 진입 후 최고가가 +1% 이상 올라야 적용
     take_profit_rate: float = 0.0     # 고정 익절 (%) — 0 = 사용 안 함 (트레일링 스탑으로 대체)
-    use_first_bar_low_stop: bool = False # 첫 봉 저가 이탈 즉시 손절 (기본 OFF: -2% 고정 손절만 사용)
 
-    # 장 마감 일괄 청산
+    # 장 마감 일괄 청산 (오버나이트 보유 전략의 포지션은 제외)
     eod_liquidation: bool = True            # 지정 시각에 앱 매수 종목 전량 시장가 청산
     eod_liquidation_time: str = "15:15"     # 이 시각부터 청산 + 신규 매수 금지 (15:20 동시호가 전)
     carryover_sell_at_open: bool = True     # 앱이 꺼져 청산 못 하고 넘어온 종목 → 다음 날 09:00 시장가 청산
-    
+
     # 자금 관리
     order_amount_per_trade: int = 1_000_000 # 1회 매수 금액 (원)
     max_concurrent_positions: int = 3       # 최대 동시 보유 종목 수
     max_daily_loss: int = 300_000           # 당일 최대 누적 손실 허용한도 (원)
-    
-    # 중복 신호 제어
+
+    # 중복 진입 제어
     allow_reentry_same_day: bool = False    # 당일 동일 종목 재진입 허용 여부
-    min_volume_ratio: float = 0.7           # 돌파 봉 거래량 > 첫 3분봉 거래량 × 0.7 (70% 초과)
-
-    # 매수 전략 조합 (strategy/combiner.py)
-    #   open_breakout = A. 첫 봉 시가 돌파 / orb_high = B. 첫 봉 고가 돌파 / vwap_pullback = C. VWAP 눌림 반등
-    #   prev_high = D. 전일 고가 돌파 / day_swing_high = E. 당일 전고점 돌파
-    #   smc_fvg = F. SMC CHoCH → 첫 FVG 중간값 지정가
-    entry_strategies: List[str] = field(default_factory=lambda: ["open_breakout"])
-    entry_logic: str = "OR"                 # OR = 하나라도 신호 → 진입 / AND = 선택 전략이 당일 모두 신호를 낸 시점에 진입
-
-    # 진입 시간대: 시작은 A~F 공통 trade_start_time, 마감은 A·B·D·E = trade_end_time / C·F = 14:00 고정
-    # C. VWAP 눌림 반등
-    vwap_trend_pct: float = 1.0             # 눌림 전에 고가가 VWAP보다 N% 이상 위에 있었어야 함 (추세 확인)
-    vwap_touch_pct: float = 0.3             # 저가가 VWAP ±N% 안까지 내려오면 '눌림'
-
-    # E. 당일 전고점 돌파 (청산은 공통 설정)
-    dsh_swing_len: int = 2                  # 전고점 판정: 좌우 N봉보다 고가가 높아야 함
-
-    # F. SMC: CHoCH → 첫 FVG 중간값 지정가 진입
-    smc_swing_len: int = 2                  # 스윙 고/저점 판정: 좌우 N봉보다 높/낮아야 함
-    smc_stop_mode: str = "swing"            # swing = CHoCH 전 스윙 저점 아래 / fvg = FVG 하단 아래
-    smc_min_risk_pct: float = 0.3           # 손절폭(진입가 대비 %)이 이보다 작으면 생략 (수수료·호가 대비 의미 없음)
-    smc_max_risk_pct: float = 3.0           # 손절폭이 이보다 크면 생략
-    smc_fvg_expiry_bars: int = 10           # 지정가 대기 최대 봉 수 (10봉 = 30분)
