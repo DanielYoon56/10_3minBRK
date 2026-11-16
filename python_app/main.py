@@ -298,7 +298,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_trading)
         header.addWidget(self.btn_stop)
-        self.btn_halt = QPushButton("신규 매수 중단")
+        self.btn_halt = QPushButton("⏸ 신규 매수 일시중단")
         self.btn_halt.setCheckable(True)
         self.btn_halt.setEnabled(False)
         self.btn_halt.setToolTip("비상 정지: 신규 매수만 막습니다. 보유 종목의 손절·청산 감시는 계속됩니다.")
@@ -1255,8 +1255,10 @@ class MainWindow(QMainWindow):
             self.btn_halt.setEnabled(True)
             halted = bool(self.engine.guard.emergency)       # 전날 건 비상 정지는 재시작해도 유지된다
             self.btn_halt.setChecked(halted)
-            self.btn_halt.setText("신규 매수 재개" if halted else "신규 매수 중단")
-            self.lbl_status.setText("상태: 자동매매 가동 중")
+            self.btn_halt.setText("▶ 신규 매수 재개" if halted else "⏸ 신규 매수 일시중단")
+            self.btn_halt.setStyleSheet("background-color: #d29922; color: #0d1117; font-weight: bold;" if halted else "")
+            self.lbl_status.setText(f"상태: 신규 매수 중단 — {self.engine.guard.emergency}" if halted else "상태: 자동매매 가동 중")
+            self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;" if halted else "color: #3fb950; font-weight: bold;")
             self.statusBar.showMessage(f"[{'실거래' if self.mode == TradingMode.REAL else '모의거래'}] 자동매매 가동 중")
             self._start_retries = 0
         else:
@@ -1280,9 +1282,16 @@ class MainWindow(QMainWindow):
             return
         if checked:
             self.engine.stop_new_entries("사용자 요청")
+            self.btn_halt.setText("▶ 신규 매수 재개")
+            self.btn_halt.setStyleSheet("background-color: #d29922; color: #0d1117; font-weight: bold;")
+            self.lbl_status.setText("상태: 신규 매수 중단 — 사용자 요청")
+            self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
         else:
             self.engine.resume_entries()
-        self.btn_halt.setText("신규 매수 재개" if checked else "신규 매수 중단")
+            self.btn_halt.setText("⏸ 신규 매수 일시중단")
+            self.btn_halt.setStyleSheet("")
+            self.lbl_status.setText("상태: 자동매매 가동 중")
+            self.lbl_status.setStyleSheet("color: #3fb950; font-weight: bold;")
 
     def stop_trading(self):
         if self.worker:
@@ -1294,6 +1303,9 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_halt.setEnabled(False)
+        self.btn_halt.setChecked(False)
+        self.btn_halt.setText("⏸ 신규 매수 일시중단")
+        self.btn_halt.setStyleSheet("")
         self.btn_mock.setEnabled(True)
         self.btn_real.setEnabled(True)
 
@@ -1339,6 +1351,18 @@ class MainWindow(QMainWindow):
         self.lbl_active.setText(f"관리 종목: {active} / {self.config.max_concurrent_positions}")
         if snap["halted"]:
             self.lbl_status.setText("상태: 신규 매수 중단 — " + snap["halted"].split(" → ")[0].split(" (")[0])
+            self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
+            if not self.btn_halt.isChecked():
+                self.btn_halt.setChecked(True)
+            self.btn_halt.setText("▶ 신규 매수 재개")
+            self.btn_halt.setStyleSheet("background-color: #d29922; color: #0d1117; font-weight: bold;")
+        else:
+            self.lbl_status.setText("상태: 자동매매 가동 중")
+            self.lbl_status.setStyleSheet("color: #3fb950; font-weight: bold;")
+            if self.btn_halt.isChecked():
+                self.btn_halt.setChecked(False)
+            self.btn_halt.setText("⏸ 신규 매수 일시중단")
+            self.btn_halt.setStyleSheet("")
 
         quotes = snap["quotes"]
         watch = snap["watchlist"]
