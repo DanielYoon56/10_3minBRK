@@ -186,23 +186,40 @@ class EngineWorker(QThread):
         engine.on_event = lambda lv, msg: self.log_message.emit(lv, msg)
 
     def run(self):
-        ok = self.engine.start(live_confirmed=self.live_confirmed)
-        self.started_ok.emit(ok)
-        if not ok:
-            return
-        self._running = True
-        while self._running:
+        try:
+            ok = self.engine.start(live_confirmed=self.live_confirmed)
+            self.started_ok.emit(ok)
+            if not ok:
+                return
+            self._running = True
+            while self._running:
+                try:
+                    self.engine.tick()
+                except Exception as e:
+                    logger.exception("엔진 tick 오류")
+                    self.log_message.emit("error", f"엔진 오류: {e}")
+                # 100ms 단위 슬라이스로 대기하여 중지 요청 시 즉시 반응
+                for _ in range(10):
+                    if not self._running:
+                        break
+                    self.msleep(100)
+        finally:
+            self._running = False
             try:
-                self.engine.tick()
+                self.engine.stop()
             except Exception as e:
-                logger.exception("엔진 tick 오류")
-                self.log_message.emit("error", f"엔진 오류: {e}")
-            self.msleep(1000)
-        self.engine.stop()
+                logger.exception("엔진 stop 오류")
 
-    def stop(self):
+    def request_stop(self):
+        """비동기 정지 요청 (GUI 메인 스레드 블로킹 방지)"""
         self._running = False
-        self.wait(5000)
+        if self.engine:
+            self.engine.running = False
+
+    def stop(self, timeout_ms: int = 3000):
+        """동기 정지 (앱 종료 시에만 사용)"""
+        self.request_stop()
+        self.wait(timeout_ms)
 
 
 def _scrollable(widget: QWidget) -> QScrollArea:
@@ -1204,6 +1221,8 @@ class MainWindow(QMainWindow):
             f"· 장 마감 일괄 청산: {c.eod_liquidation_time if c.eod_liquidation else '사용 안 함'}")
 
     def start_trading(self, interactive: bool = True):
+        if self.worker and self.worker.isRunning():
+            return
         self._keys_from_inputs()
         app_key, secret = kiwoom_keys(self.cfg, self.mode)
         label = "실거래" if self.mode == TradingMode.REAL else "모의거래"
@@ -1243,10 +1262,15 @@ class MainWindow(QMainWindow):
         self.worker = EngineWorker(self.engine, live_confirmed)
         self.worker.log_message.connect(lambda lv, m: self.append_log(lv, m, _from_engine=True))
         self.worker.started_ok.connect(self.on_engine_started)
+        self.worker.finished.connect(self.on_engine_stopped)
         self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_halt.setEnabled(False)
         self.btn_mock.setEnabled(False)
         self.btn_real.setEnabled(False)
         self.lbl_status.setText("상태: 접속 중…")
+        self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
+        self.statusBar.showMessage(f"[{label}] 키움 API 접속 중…")
         self.worker.start()
 
     def on_engine_started(self, ok: bool):
@@ -1264,6 +1288,8 @@ class MainWindow(QMainWindow):
         else:
             self._reset_buttons()
             self.lbl_status.setText("상태: 접속 실패")
+            self.lbl_status.setStyleSheet("color: #f85149; font-weight: bold;")
+            self.statusBar.showMessage(f"[{'실거래' if self.mode == TradingMode.REAL else '모의거래'}] 키움 API 접속 실패")
             if self.autostart:
                 # 절전 해제 직후 네트워크가 늦게 붙는 경우 대비: 1분 간격 최대 5회 재시도
                 self._start_retries += 1
@@ -1294,10 +1320,26 @@ class MainWindow(QMainWindow):
             self.lbl_status.setStyleSheet("color: #3fb950; font-weight: bold;")
 
     def stop_trading(self):
-        if self.worker:
-            self.worker.stop()
+        """자동매매 중지 — 비동기로 엔진을 안전하게 정지시키고 완료 시 UI 갱신"""
+        if not self.worker or not self.worker.isRunning():
+            self._reset_buttons()
+            self.lbl_status.setText("상태: 중지됨 (보유 종목 유지)")
+            self.lbl_status.setStyleSheet("color: #8b949e; font-weight: bold;")
+            return
+        self.btn_stop.setEnabled(False)
+        self.btn_halt.setEnabled(False)
+        self.lbl_status.setText("상태: 중지 중…")
+        self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
+        self.statusBar.showMessage("자동매매 중지 진행 중…")
+        self.worker.request_stop()
+
+    def on_engine_stopped(self):
+        """엔진 워커 스레드가 안전하게 종료되었을 때 호출"""
         self._reset_buttons()
-        self.lbl_status.setText("상태: 중지됨 (보유 종목 유지)")
+        if "접속 실패" not in self.lbl_status.text():
+            self.lbl_status.setText("상태: 중지됨 (보유 종목 유지)")
+            self.lbl_status.setStyleSheet("color: #8b949e; font-weight: bold;")
+            self.statusBar.showMessage(f"[{'실거래' if self.mode == TradingMode.REAL else '모의거래'}] 자동매매 중지됨")
 
     def _reset_buttons(self):
         self.btn_start.setEnabled(True)
@@ -1318,7 +1360,7 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 event.ignore()
                 return
-            self.worker.stop()
+            self.worker.stop(timeout_ms=3000)
         event.accept()
 
     # ================================================================ 화면 갱신
@@ -1349,20 +1391,24 @@ class MainWindow(QMainWindow):
         self.lbl_pnl.setStyleSheet(f"color: {'#ff7b72' if pnl > 0 else '#79c0ff' if pnl < 0 else '#c9d1d9'};")
         active = sum(1 for m in snap["managed"].values() if m["status"] in ("BUYING", "HOLDING", "SELLING"))
         self.lbl_active.setText(f"관리 종목: {active} / {self.config.max_concurrent_positions}")
-        if snap["halted"]:
-            self.lbl_status.setText("상태: 신규 매수 중단 — " + snap["halted"].split(" → ")[0].split(" (")[0])
-            self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
-            if not self.btn_halt.isChecked():
-                self.btn_halt.setChecked(True)
-            self.btn_halt.setText("▶ 신규 매수 재개")
-            self.btn_halt.setStyleSheet("background-color: #d29922; color: #0d1117; font-weight: bold;")
-        else:
-            self.lbl_status.setText("상태: 자동매매 가동 중")
-            self.lbl_status.setStyleSheet("color: #3fb950; font-weight: bold;")
-            if self.btn_halt.isChecked():
-                self.btn_halt.setChecked(False)
-            self.btn_halt.setText("⏸ 신규 매수 일시중단")
-            self.btn_halt.setStyleSheet("")
+
+        # 상태 라벨 및 비상 정지 버튼 동기화는 '가동 중'일 때만 수행
+        is_running = bool(self.worker and self.worker.isRunning() and self.engine and self.engine.running)
+        if is_running:
+            if snap["halted"]:
+                self.lbl_status.setText("상태: 신규 매수 중단 — " + snap["halted"].split(" → ")[0].split(" (")[0])
+                self.lbl_status.setStyleSheet("color: #d29922; font-weight: bold;")
+                if not self.btn_halt.isChecked():
+                    self.btn_halt.setChecked(True)
+                self.btn_halt.setText("▶ 신규 매수 재개")
+                self.btn_halt.setStyleSheet("background-color: #d29922; color: #0d1117; font-weight: bold;")
+            else:
+                self.lbl_status.setText("상태: 자동매매 가동 중")
+                self.lbl_status.setStyleSheet("color: #3fb950; font-weight: bold;")
+                if self.btn_halt.isChecked():
+                    self.btn_halt.setChecked(False)
+                self.btn_halt.setText("⏸ 신규 매수 일시중단")
+                self.btn_halt.setStyleSheet("")
 
         quotes = snap["quotes"]
         watch = snap["watchlist"]

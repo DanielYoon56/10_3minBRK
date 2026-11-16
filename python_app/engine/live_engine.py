@@ -629,6 +629,8 @@ class LiveTradingEngine:
     # ================================================================ 청산
     def _check_exits(self, now: datetime):
         for sym, m in list(self.managed.items()):
+            if not self.running:
+                break
             if m.status != "HOLDING":
                 continue
             pos = self.positions.get(sym)
@@ -748,6 +750,8 @@ class LiveTradingEngine:
         fresh: List[Bar] = []
         try:
             for sym, name in self.watchlist:
+                if not self.running:
+                    break
                 try:
                     bars = self.broker.get_minute_bars(sym, self.trade_date, now, tic=3)
                 except Exception as e:
