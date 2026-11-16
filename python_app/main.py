@@ -378,6 +378,7 @@ class MainWindow(QMainWindow):
 
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
+        self.txt_log.document().setMaximumBlockCount(2000)
         tabs.addTab(self.txt_log, "실행 로그")
         self.tabs = tabs
         tabs.currentChanged.connect(lambda i: tabs.widget(i) is self.daily_tab and self.refresh_daily())

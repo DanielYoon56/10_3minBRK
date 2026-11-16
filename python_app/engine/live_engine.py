@@ -186,6 +186,7 @@ class LiveTradingEngine:
         self._last_sync = datetime.min
         self._eod_logged = False
         self._lock = threading.RLock()
+        self._last_snapshot: Dict = {}
 
     # ================================================================ 이벤트/로그
     def _emit(self, level: str, msg: str, push: bool = False):
@@ -896,7 +897,13 @@ class LiveTradingEngine:
 
     # ================================================================ GUI 스냅샷
     def snapshot(self) -> Dict:
-        with self._lock:
+        # GUI 멈춤(화면 하얘짐/응답 없음) 방지: 엔진이 3분봉 조회 등으로 바쁠 땐 직전 스냅샷 즉시 반환
+        acquired = self._lock.acquire(timeout=0.05)
+        if not acquired:
+            if self._last_snapshot:
+                return dict(self._last_snapshot)
+            self._lock.acquire()  # 최초 1회 캐시 생성 시에만 대기
+        try:
             states = {}
             for sym, _ in self.watchlist:
                 s = self.manager.sessions.get(sym)
@@ -910,7 +917,7 @@ class LiveTradingEngine:
                     "bars": len(s.bars) if s else 0,
                     "signals": self.manager.fired_today(sym),
                 }
-            return {
+            snap = {
                 "watchlist": list(self.watchlist),
                 "scan_status": self.scanner.status(self.clock()) if self.scanner else "",
                 "strategies": self.manager.stats_snapshot(),
@@ -926,3 +933,7 @@ class LiveTradingEngine:
                 "quotes": {**self.last_bar_close, **self.last_quotes},
                 "states": states,
             }
+            self._last_snapshot = snap
+            return snap
+        finally:
+            self._lock.release()
