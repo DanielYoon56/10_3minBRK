@@ -1223,6 +1223,8 @@ class MainWindow(QMainWindow):
     def start_trading(self, interactive: bool = True):
         if self.worker and self.worker.isRunning():
             return
+        self.cfg = load_config()
+        self.config = strategy_config_from(self.cfg)
         self._keys_from_inputs()
         app_key, secret = kiwoom_keys(self.cfg, self.mode)
         label = "실거래" if self.mode == TradingMode.REAL else "모의거래"
