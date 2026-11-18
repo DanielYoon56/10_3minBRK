@@ -646,14 +646,25 @@ class LiveTradingEngine:
             pos.highest_price = max(m.highest_price, pos.highest_price, pos.avg_price)
             owner = self.manager.strategy(m.strategy)     # 청산은 이 포지션을 소유한 전략이 판정
             exit_cfg = owner.exit_config(self.config) if owner else self.config
-            pos.stop_loss_price = m.stop_price if m.stop_price > 0 else stop_loss_price(pos.avg_price, exit_cfg)
+            hard_stop = stop_loss_price(pos.avg_price, exit_cfg)
+            if m.stop_price > 0 and not m.stop_manual:
+                # 하이브리드 칼손절: 전략 손절가와 최대 손절한도(-1.5%) 중 더 높은 가격(손실이 더 작은 가격) 적용
+                effective_stop = max(m.stop_price, hard_stop)
+                stop_label = "(전략 손절가)" if effective_stop == m.stop_price else f"최대 손절한도 (-{exit_cfg.stop_loss_rate:g}%)"
+            elif m.stop_price > 0 and m.stop_manual:
+                effective_stop = m.stop_price
+                stop_label = "(수동 손절가)"
+            else:
+                effective_stop = hard_stop
+                stop_label = f"-{exit_cfg.stop_loss_rate:g}%"
+            pos.stop_loss_price = effective_stop
 
             if m.carried_over and self.config.carryover_sell_at_open and not m.hold_overnight:
                 self._sell(m, pos, price, "전일 이월 종목 시초 청산 (전날 장 마감 청산 누락)", now)
                 continue
 
             kw = dict(take_profit_price=m.target_price, use_trailing=m.use_trailing,
-                      stop_label=("(수동 손절가)" if m.stop_manual else "(전략 손절가)" if m.stop_price > 0 else ""),
+                      stop_label=stop_label,
                       risk_stop=m.risk_stop)
             decision = (owner.check_exit(pos, price, self.config, now, trade=m, **kw) if owner
                         else check_exit(pos, price, self.config, **kw))

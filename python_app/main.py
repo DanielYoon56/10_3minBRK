@@ -1514,10 +1514,7 @@ def main():
         sys.exit(0)
 
     window = MainWindow(autostart=args.autostart)
-    if args.autostart:
-        window.showMinimized()
-    else:
-        window.show()
+    window.show()
     code = app.exec()
     lock.unlock()
     sys.exit(code)
